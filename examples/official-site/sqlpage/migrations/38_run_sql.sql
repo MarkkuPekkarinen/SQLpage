@@ -56,6 +56,8 @@ for help with manipulating the json array returned by `run_sql`.
  - **variables**: the included file will have access to the same variables (URL parameters, POST variables, etc.)
    as the calling file.
    If the included file changes the value of a variable or creates a new variable, the change will not be visible in the calling file.
+ - **per-row execution**: when `sqlpage.run_sql(...)` is a standalone selected column in a query that returns several rows, the included file runs once per returned row.
+   Use `SET included = sqlpage.run_sql(...)` first if the included file should run only once for the page.
 
 ### Parameters
 

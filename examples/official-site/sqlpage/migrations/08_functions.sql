@@ -204,6 +204,9 @@ VALUES (
         'arrows-shuffle',
         'Returns a cryptographically secure random string of the given length.
 
+When used as a standalone selected column in a query that returns several rows, `random_string` runs once per returned row.
+Use `SET token = sqlpage.random_string(32)` first if you want one token reused later in the page.
+
 ### Example
 
 Generate a random string of 32 characters and use it as a session ID stored in a cookie:
@@ -414,9 +417,10 @@ from json_each(sqlpage.exec(''curl'', ''https://jsonplaceholder.typicode.com/use
    This means that the SQLPage server will not be blocked while the command is running, it will be able to serve other requests, but it will not be able to serve the current request until the command has finished.
    You should generally avoid long running commands.
  - If the program name is NULL, the result will be NULL.
- - If any argument is NULL, it will be passed to the command as an empty string.
- - If the command exits with a non-zero exit code, the function will raise an error.
- - Arbitrary SQL operations are not allowed as sqlpage function arguments. Use `SET` to assign the result of a SQL query to a variable, and then use that variable as an argument to `sqlpage.exec`.
+  - If any argument is NULL, it will be passed to the command as an empty string.
+  - If the command exits with a non-zero exit code, the function will raise an error.
+  - Arbitrary SQL operations are not allowed as sqlpage function arguments. Use `SET` to assign the result of a SQL query to a variable, and then use that variable as an argument to `sqlpage.exec`.
+  - When `sqlpage.exec(...)` is a standalone selected column, the command runs once per returned row. Use `SET command_result = sqlpage.exec(...)` first if the command should run only once for the page.
 '
     );
 INSERT INTO sqlpage_function_parameters (

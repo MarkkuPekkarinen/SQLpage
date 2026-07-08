@@ -9,9 +9,8 @@ use crate::{AppState, Database};
 use async_trait::async_trait;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, ObjectName, ObjectNamePart, SelectFlavor, SelectItem, Set, SetExpr,
-    Spanned, Statement, Value, ValueWithSpan,
+    CastKind, DataType, Expr, Ident, ObjectName, ObjectNamePart, SelectFlavor, SelectItem, Set,
+    SetExpr, Spanned, Statement, Value, ValueWithSpan,
 };
 use sqlparser::dialect::{
     Dialect, DuckDbDialect, GenericDialect, MsSqlDialect, MySqlDialect, OracleDialect,
@@ -25,7 +24,9 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+mod delayed_functions;
 mod parameter_extraction;
+use self::delayed_functions::extract_delayed_functions_from_query;
 pub(super) use self::parameter_extraction::{
     DB_PLACEHOLDERS, DbPlaceHolder, ParamExtractContext, SqlPageFunctionError,
     function_args_to_stmt_params,
@@ -134,7 +135,7 @@ pub(super) enum ParsedStatement {
     Error(anyhow::Error),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub(super) enum SimpleSelectValue {
     Static(serde_json::Value),
     Dynamic(StmtParam),
@@ -207,18 +208,24 @@ fn parse_single_statement(
         semicolon = true;
     }
 
-    let mut params = match ParameterExtractor::extract_parameters(&mut stmt, db_info.clone()) {
-        Ok(p) => p,
-        Err(err) => return Some(ParsedStatement::Error(err)),
-    };
     let dbms = db_info.database_type;
-    if let Some(parsed) = extract_set_variable(&mut stmt, &mut params, db_info) {
+    if let Some(parsed) = extract_set_variable(&mut stmt, db_info) {
         return Some(parsed);
     }
     if let Some(csv_import) = extract_csv_copy_statement(&mut stmt) {
         return Some(ParsedStatement::CsvImport(csv_import));
     }
-    if let Some(static_statement) = extract_static_simple_select(&stmt, &params) {
+
+    let delayed_functions = extract_delayed_functions_from_query(&mut stmt);
+
+    let params = match ParameterExtractor::extract_parameters(&mut stmt, db_info.clone()) {
+        Ok(p) => p,
+        Err(err) => return Some(ParsedStatement::Error(err)),
+    };
+
+    if delayed_functions.is_empty()
+        && let Some(static_statement) = extract_static_simple_select(&stmt, &params)
+    {
         log::debug!(
             "Optimised a static simple select to avoid a trivial database query: {stmt} optimized to {static_statement:?}"
         );
@@ -227,8 +234,6 @@ fn parse_single_statement(
             query_position: extract_query_start(&stmt),
         });
     }
-
-    let delayed_functions = extract_toplevel_functions(&mut stmt);
 
     if let Err(err) = validate_function_calls(&stmt) {
         return Some(ParsedStatement::Error(err));
@@ -308,98 +313,6 @@ pub struct DelayedFunctionCall {
     pub function: SqlPageFunctionName,
     pub argument_col_names: Vec<String>,
     pub target_col_name: String,
-}
-
-/// The execution of top-level functions is delayed until after the query has been executed.
-/// For instance, `SELECT sqlpage.fetch(x) FROM t` will be executed as `SELECT x as _sqlpage_f0_a0 FROM t`
-/// and the `sqlpage.fetch` function will be called with the value of `_sqlpage_f0_a0` after the query has been executed,
-/// on each row of the result set.
-fn extract_toplevel_functions(stmt: &mut Statement) -> Vec<DelayedFunctionCall> {
-    struct SelectItemToAdd {
-        expr_to_insert: SelectItem,
-        position: usize,
-    }
-    let mut delayed_function_calls: Vec<DelayedFunctionCall> = Vec::new();
-    let set_expr = match stmt {
-        Statement::Query(q) => q.body.as_mut(),
-        _ => return delayed_function_calls,
-    };
-    let select_items = match set_expr {
-        sqlparser::ast::SetExpr::Select(s) => &mut s.projection,
-        _ => return delayed_function_calls,
-    };
-    let mut select_items_to_add: Vec<SelectItemToAdd> = Vec::new();
-
-    for (position, select_item) in select_items.iter_mut().enumerate() {
-        let SelectItem::ExprWithAlias {
-            expr:
-                Expr::Function(Function {
-                    name: ObjectName(func_name_parts),
-                    args:
-                        FunctionArguments::List(FunctionArgumentList {
-                            args,
-                            duplicate_treatment: None,
-                            ..
-                        }),
-                    ..
-                }),
-            alias,
-        } = select_item
-        else {
-            continue;
-        };
-        let Some(func_name) = extract_sqlpage_function_name(func_name_parts) else {
-            continue;
-        };
-        func_name_parts.clear(); // mark the function for deletion
-        let mut argument_col_names = Vec::with_capacity(args.len());
-        for (arg_idx, arg) in args.iter_mut().enumerate() {
-            match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-                | FunctionArg::Named {
-                    arg: FunctionArgExpr::Expr(expr),
-                    ..
-                } => {
-                    let func_idx = delayed_function_calls.len();
-                    let argument_col_name = format!("_sqlpage_f{func_idx}_a{arg_idx}");
-                    argument_col_names.push(argument_col_name.clone());
-                    let expr_to_insert = SelectItem::ExprWithAlias {
-                        expr: std::mem::replace(expr, Expr::value(Value::Null)),
-                        alias: Ident::with_quote('"', argument_col_name),
-                    };
-                    select_items_to_add.push(SelectItemToAdd {
-                        expr_to_insert,
-                        position,
-                    });
-                }
-                other => {
-                    log::error!("Unsupported argument to {func_name}: {other}");
-                }
-            }
-        }
-        delayed_function_calls.push(DelayedFunctionCall {
-            function: func_name,
-            argument_col_names,
-            target_col_name: alias.value.clone(),
-        });
-    }
-    // Insert the new select items (the function arguments) at the positions where the function calls were
-    let mut it = select_items_to_add.into_iter().peekable();
-    *select_items = std::mem::take(select_items)
-        .into_iter()
-        .enumerate()
-        .flat_map(|(position, item)| {
-            let mut items = Vec::with_capacity(1);
-            while it.peek().is_some_and(|x| x.position == position) {
-                items.push(it.next().unwrap().expr_to_insert);
-            }
-            if items.is_empty() {
-                items.push(item);
-            }
-            items
-        })
-        .collect();
-    delayed_function_calls
 }
 
 fn extract_static_simple_select(
@@ -509,11 +422,7 @@ fn is_simple_select_placeholder(e: &Expr) -> bool {
     }
 }
 
-fn extract_set_variable(
-    stmt: &mut Statement,
-    params: &mut Vec<StmtParam>,
-    db_info: &DbInfo,
-) -> Option<ParsedStatement> {
+fn extract_set_variable(stmt: &mut Statement, db_info: &DbInfo) -> Option<ParsedStatement> {
     if let Statement::Set(Set::SingleAssignment {
         variable: ObjectName(name),
         values,
@@ -529,13 +438,23 @@ fn extract_set_variable(
             StmtParam::PostOrGet(std::mem::take(&mut ident.value))
         };
         let owned_expr = std::mem::replace(value, Expr::value(Value::Null));
-        let mut params_iter = params.iter().cloned();
-        if let Some(value) = expr_to_simple_select_val(&mut params_iter, &owned_expr) {
-            return Some(ParsedStatement::StaticSimpleSet { variable, value });
+        let mut select_stmt = expr_to_value_query_statement(owned_expr);
+        let delayed_functions = extract_delayed_functions_from_query(&mut select_stmt);
+        let params = match ParameterExtractor::extract_parameters(&mut select_stmt, db_info.clone())
+        {
+            Ok(p) => p,
+            Err(err) => return Some(ParsedStatement::Error(err)),
+        };
+        if delayed_functions.is_empty()
+            && let Some(values) = extract_static_simple_select(&select_stmt, &params)
+            && let [(_, value)] = values.as_slice()
+        {
+            return Some(ParsedStatement::StaticSimpleSet {
+                variable,
+                value: value.clone(),
+            });
         }
 
-        let mut select_stmt: Statement = expr_to_statement(owned_expr);
-        let delayed_functions = extract_toplevel_functions(&mut select_stmt);
         if let Err(err) = validate_function_calls(&select_stmt) {
             return Some(ParsedStatement::Error(err));
         }
@@ -543,7 +462,7 @@ fn extract_set_variable(
         let mut value = StmtWithParams {
             query: select_stmt.to_string(),
             query_position: extract_query_start(&select_stmt),
-            params: std::mem::take(params),
+            params,
             delayed_functions,
             json_columns,
         };
@@ -666,7 +585,11 @@ fn is_json_function(expr: &Expr) -> bool {
     }
 }
 
-fn expr_to_statement(expr: Expr) -> Statement {
+fn expr_to_value_query_statement(expr: Expr) -> Statement {
+    if let Expr::Subquery(query) = expr {
+        return Statement::Query(query);
+    }
+
     Statement::Query(Box::new(sqlparser::ast::Query {
         with: None,
         body: Box::new(sqlparser::ast::SetExpr::Select(Box::new(
@@ -825,12 +748,12 @@ mod test {
     }
 
     #[test]
-    fn test_extract_toplevel_delayed_functions() {
+    fn test_extract_delayed_functions_from_projection() {
         let mut ast = parse_stmt(
             "select sqlpage.fetch($x) as x, sqlpage.persist_uploaded_file('a', 'b') as y from t",
             &PostgreSqlDialect {},
         );
-        let functions = extract_toplevel_functions(&mut ast);
+        let functions = extract_delayed_functions_from_query(&mut ast);
         assert_eq!(
             ast.to_string(),
             "SELECT $x AS \"_sqlpage_f0_a0\", 'a' AS \"_sqlpage_f1_a0\", 'b' AS \"_sqlpage_f1_a1\" FROM t"
@@ -856,12 +779,39 @@ mod test {
     }
 
     #[test]
-    fn test_extract_toplevel_delayed_functions_parameter_order() {
+    fn test_projected_column_sqlpage_function_is_delayable() {
+        let mut ast = parse_postgres_stmt("select sqlpage.url_encode(url) as encoded from t");
+        let functions = extract_delayed_functions_from_query(&mut ast);
+        assert_eq!(ast.to_string(), "SELECT url AS \"_sqlpage_f0_a0\" FROM t");
+        assert_eq!(
+            functions,
+            vec![DelayedFunctionCall {
+                function: SqlPageFunctionName::url_encode,
+                argument_col_names: vec!["_sqlpage_f0_a0".to_string()],
+                target_col_name: "encoded".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_nested_sqlpage_functions_are_not_delayable() {
+        let mut ast =
+            parse_postgres_stmt("select coalesce(sqlpage.url_encode(url), '') as encoded from t");
+        let functions = extract_delayed_functions_from_query(&mut ast);
+        assert_eq!(functions, []);
+        assert_eq!(
+            ast.to_string(),
+            "SELECT coalesce(sqlpage.url_encode(url), '') AS encoded FROM t"
+        );
+    }
+
+    #[test]
+    fn test_extract_delayed_functions_parameter_order() {
         // The order of the function arguments should be preserved
         // Otherwise the statement parameters will be bound to the wrong arguments
         let sql = "select $a as a, sqlpage.exec('xxx', x = $b) as b, $c as c from t";
         let mut ast = parse_postgres_stmt(sql);
-        let delayed_functions = extract_toplevel_functions(&mut ast);
+        let delayed_functions = extract_delayed_functions_from_query(&mut ast);
         assert_eq!(
             ast.to_string(),
             "SELECT $a AS a, 'xxx' AS \"_sqlpage_f0_a0\", x = $b AS \"_sqlpage_f0_a1\", $c AS c FROM t"
@@ -875,6 +825,21 @@ mod test {
                     "_sqlpage_f0_a1".to_string()
                 ],
                 target_col_name: "b".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_zero_argument_functions_are_delayable() {
+        let mut ast = parse_postgres_stmt("select sqlpage.version() as v from t");
+        let delayed_functions = extract_delayed_functions_from_query(&mut ast);
+        assert_eq!(ast.to_string(), "SELECT NULL AS \"v\" FROM t");
+        assert_eq!(
+            delayed_functions,
+            &[DelayedFunctionCall {
+                function: SqlPageFunctionName::version,
+                argument_col_names: vec![],
+                target_col_name: "v".to_string()
             }]
         );
     }
@@ -899,7 +864,7 @@ mod test {
 
     #[test]
     fn test_parse_sql_unsupported_expr_in_sqlpage_arg() {
-        let sql = "SELECT sqlpage.link('x', json_build_object('k', c)) FROM (SELECT 1 AS c) t";
+        let sql = "SELECT coalesce(sqlpage.link('x', json_build_object('k', c)), '') FROM (SELECT 1 AS c) t";
         let db_info = create_test_db_info(SupportedDatabase::Postgres);
         let mut parsed = parse_sql(&db_info, &PostgreSqlDialect {}, sql).unwrap();
         let stmt = parsed.next().expect("one statement");
@@ -916,7 +881,7 @@ mod test {
 
     #[test]
     fn test_parse_sql_unemulated_function_in_sqlpage_arg() {
-        let sql = "SELECT sqlpage.link('x', upper('a')) FROM (SELECT 1) t";
+        let sql = "SELECT coalesce(sqlpage.link('x', upper('a')), '') FROM (SELECT 1) t";
         let db_info = create_test_db_info(SupportedDatabase::Postgres);
         let mut parsed = parse_sql(&db_info, &PostgreSqlDialect {}, sql).unwrap();
         let stmt = parsed.next().expect("one statement");
@@ -1227,7 +1192,7 @@ mod test {
 
     #[test]
     fn test_set_variable_with_sqlpage_function() {
-        let sql = "set x = sqlpage.url_encode(some_db_function())";
+        let sql = "set x = sqlpage.url_encode(UPPER('a'))";
         for &(dialect, dbms) in ALL_DIALECTS {
             let mut parser = Parser::new(dialect).try_with_sql(sql).unwrap();
             let db_info = create_test_db_info(dbms);
@@ -1259,9 +1224,46 @@ mod test {
                     target_col_name: "sqlpage_set_expr".to_string()
                 }]
             );
-            assert_eq!(query, "SELECT some_db_function() AS \"_sqlpage_f0_a0\"");
+            assert_eq!(query, "SELECT UPPER('a') AS \"_sqlpage_f0_a0\"");
             assert_eq!(params, []);
             assert_eq!(json_columns, Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn test_set_variable_subquery_uses_inner_query() {
+        let sql = "set x = (select sqlpage.fetch(url) from t where enabled)";
+        for &(dialect, dbms) in ALL_DIALECTS {
+            let mut parser = Parser::new(dialect).try_with_sql(sql).unwrap();
+            let db_info = create_test_db_info(dbms);
+            let stmt = parse_single_statement(&mut parser, &db_info, sql);
+            let Some(ParsedStatement::SetVariable {
+                variable,
+                value:
+                    StmtWithParams {
+                        query,
+                        params,
+                        delayed_functions,
+                        ..
+                    },
+            }) = stmt
+            else {
+                panic!("for dialect {dialect:?}: {stmt:#?} instead of SetVariable");
+            };
+            assert_eq!(variable, StmtParam::PostOrGet("x".to_string()));
+            assert_eq!(
+                delayed_functions,
+                [DelayedFunctionCall {
+                    function: SqlPageFunctionName::fetch,
+                    argument_col_names: vec!["_sqlpage_f0_a0".to_string()],
+                    target_col_name: "sqlpage.fetch(url)".to_string()
+                }]
+            );
+            assert_eq!(
+                query,
+                "SELECT url AS \"_sqlpage_f0_a0\" FROM t WHERE enabled"
+            );
+            assert_eq!(params, []);
         }
     }
 

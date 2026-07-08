@@ -15,7 +15,6 @@ use super::sql::{
 use crate::dynamic_component::parse_dynamic_rows;
 use crate::utils::add_value_to_map;
 use crate::webserver::ErrorWithStatus;
-use crate::webserver::database::sql_to_json::row_to_string;
 use crate::webserver::http_request_info::ExecutionContext;
 use crate::webserver::request_variables::SetVariablesMap;
 use crate::webserver::single_or_vec::SingleOrVec;
@@ -135,6 +134,29 @@ fn create_db_query_span(
     (span, operation_name)
 }
 
+fn create_query_metrics<'a>(
+    request: &'a ExecutionContext,
+    source_file: &Path,
+    statement: &StmtWithParams,
+    query: &StatementWithParams<'_>,
+) -> (tracing::Span, DbQueryMetricsContext<'a>) {
+    let db_system_name = request.app_state.db.info.database_type.otel_name();
+    let (query_span, operation_name) = create_db_query_span(
+        query.sql,
+        source_file,
+        statement.query_position.start.line,
+        db_system_name,
+    );
+    let query_metrics = DbQueryMetricsContext::new(
+        query_span.clone(),
+        operation_name,
+        db_system_name,
+        &request.app_state.telemetry_metrics,
+    );
+    record_query_params(&query_metrics.span, &query.param_values);
+    (query_span, query_metrics)
+}
+
 impl Database {
     pub(crate) async fn prepare_with(
         &self,
@@ -170,20 +192,7 @@ pub fn stream_query_results_with_conn<'a>(
                     request.server_timing.record("bind_params");
                     let connection = take_connection(&request.app_state.db, db_connection, request).await?;
                     log::trace!("Executing query {:?}", query.sql);
-                    let db_system_name = request.app_state.db.info.database_type.otel_name();
-                    let (query_span, operation_name) = create_db_query_span(
-                        query.sql,
-                        source_file,
-                        stmt.query_position.start.line,
-                        db_system_name,
-                    );
-                    let mut query_metrics = DbQueryMetricsContext::new(
-                        query_span.clone(),
-                        operation_name,
-                        db_system_name,
-                        &request.app_state.telemetry_metrics,
-                    );
-                    record_query_params(&query_metrics.span, &query.param_values);
+                    let (query_span, mut query_metrics) = create_query_metrics(request, source_file, stmt, &query);
                     let mut stream = connection.fetch_many(query);
                     let mut error = None;
                     let mut returned_rows: i64 = 0;
@@ -215,8 +224,7 @@ pub fn stream_query_results_with_conn<'a>(
                     }
                     drop(stream);
                     if let Some(error) = error {
-                        query_metrics.record_error(returned_rows, &error);
-                        try_rollback_transaction(connection).await;
+                        let error = record_error_and_rollback(connection, &query_metrics, returned_rows, error).await;
                         yield DbItem::Error(error);
                     } else {
                         query_metrics.record_success(returned_rows);
@@ -348,51 +356,7 @@ async fn execute_set_variable_query<'a>(
     statement: &StmtWithParams,
     source_file: &Path,
 ) -> anyhow::Result<()> {
-    let query = bind_parameters(statement, request, db_connection).await?;
-    let connection = take_connection(&request.app_state.db, db_connection, request).await?;
-    log::debug!(
-        "Executing query to set the {variable:?} variable: {:?}",
-        query.sql
-    );
-
-    let db_system_name = request.app_state.db.info.database_type.otel_name();
-    let (query_span, operation_name) = create_db_query_span(
-        query.sql,
-        source_file,
-        statement.query_position.start.line,
-        db_system_name,
-    );
-    let mut query_metrics = DbQueryMetricsContext::new(
-        query_span.clone(),
-        operation_name,
-        db_system_name,
-        &request.app_state.telemetry_metrics,
-    );
-    record_query_params(&query_metrics.span, &query.param_values);
-    let start_time = std::time::Instant::now();
-    let value = match connection
-        .fetch_optional(query)
-        .instrument(query_span.clone())
-        .await
-    {
-        Ok(Some(row)) => {
-            query_metrics.add_duration(start_time.elapsed());
-            query_metrics.record_success(1_i64);
-            row_to_string(&row)
-        }
-        Ok(None) => {
-            query_metrics.add_duration(start_time.elapsed());
-            query_metrics.record_success(0_i64);
-            None
-        }
-        Err(e) => {
-            query_metrics.add_duration(start_time.elapsed());
-            try_rollback_transaction(connection).await;
-            let err = display_stmt_db_error(source_file, statement, e);
-            query_metrics.record_error(0_i64, &err);
-            return Err(err);
-        }
-    };
+    let value = execute_scalar_query(db_connection, request, statement, source_file).await?;
 
     let (mut vars, name) = vars_and_name(request, variable)?;
 
@@ -400,6 +364,112 @@ async fn execute_set_variable_query<'a>(
     vars.insert(name.to_owned(), value.map(SingleOrVec::Single));
 
     Ok(())
+}
+
+async fn execute_scalar_query<'a>(
+    db_connection: &'a mut DbConn,
+    request: &'a ExecutionContext,
+    statement: &StmtWithParams,
+    source_file: &Path,
+) -> anyhow::Result<Option<String>> {
+    let query = bind_parameters(statement, request, db_connection).await?;
+    let connection = take_connection(&request.app_state.db, db_connection, request).await?;
+    log::debug!("Executing scalar query: {:?}", query.sql);
+    let (query_span, mut query_metrics) =
+        create_query_metrics(request, source_file, statement, &query);
+
+    let mut stream = connection.fetch_many(query);
+    let mut scalar_row = None;
+    let mut returned_rows: i64 = 0;
+    let mut error = None;
+    loop {
+        let start_next = std::time::Instant::now();
+        let next_elem = stream.next().instrument(query_span.clone()).await;
+        query_metrics.add_duration(start_next.elapsed());
+        let Some(elem) = next_elem else { break };
+
+        match parse_single_sql_result(source_file, statement, elem) {
+            row @ DbItem::Row(_) => {
+                returned_rows += 1;
+                if scalar_row.is_some() {
+                    error = Some(anyhow!(
+                        "SET scalar query returned more than one row. A SET subquery must return zero or one row."
+                    ));
+                    break;
+                }
+                scalar_row = Some(row);
+            }
+            DbItem::FinishedQuery => {}
+            DbItem::Error(err) => {
+                error = Some(err);
+                break;
+            }
+        }
+    }
+    drop(stream);
+
+    let value = if let Some(error) = error {
+        return Err(
+            record_error_and_rollback(connection, &query_metrics, returned_rows, error).await,
+        );
+    } else if let Some(mut row) = scalar_row {
+        apply_json_columns(&mut row, &statement.json_columns);
+        if let Err(error) = apply_delayed_functions(request, &statement.delayed_functions, &mut row)
+            .instrument(query_span.clone())
+            .await
+        {
+            return Err(record_error_and_rollback(
+                connection,
+                &query_metrics,
+                returned_rows,
+                error,
+            )
+            .await);
+        }
+        scalar_value_from_row(row)?
+    } else {
+        None
+    };
+
+    query_metrics.record_success(returned_rows);
+    Ok(value)
+}
+
+async fn record_error_and_rollback(
+    connection: &mut AnyConnection,
+    query_metrics: &DbQueryMetricsContext<'_>,
+    returned_rows: i64,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    query_metrics.record_error(returned_rows, &error);
+    try_rollback_transaction(connection).await;
+    error
+}
+
+fn scalar_value_from_row(item: DbItem) -> anyhow::Result<Option<String>> {
+    let DbItem::Row(Value::Object(row)) = item else {
+        anyhow::bail!("SET scalar query did not return a row object");
+    };
+    match row.len() {
+        0 => anyhow::bail!(
+            "SET scalar query returned no columns. A SET subquery must select exactly one column."
+        ),
+        1 => Ok(row
+            .into_iter()
+            .next()
+            .and_then(|(_, v)| json_to_scalar_string(v))),
+        _ => anyhow::bail!(
+            "SET scalar query returned more than one column. A SET subquery must select exactly one column."
+        ),
+    }
+}
+
+fn json_to_scalar_string(value: Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => Some(s),
+        other => Some(other.to_string()),
+    }
 }
 
 async fn execute_set_simple_static<'a>(

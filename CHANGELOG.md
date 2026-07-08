@@ -2,6 +2,11 @@
 
 ## unreleased
 
+- **SQLPage function evaluation is now lazier.** A `sqlpage.*` call that is the whole value of a selected column now runs after the database query, once for each returned row. If the query returns no rows, the function is not called. Other SQLPage function calls still run before the query when their arguments do not depend on database columns. `SET x = (SELECT ...)` now has explicit scalar-query semantics: zero rows set `x` to `NULL`, one row with one column sets the value, and multiple rows or multiple columns return a clear SQLPage error. Migration notes:
+  -  `SELECT sqlpage.fetch('https://api.example.com') AS body FROM many_rows` will now make one HTTP request per row; use `SET body = sqlpage.fetch(...)` first for one request per page.
+  - `SELECT sqlpage.exec('command') AS result FROM many_rows` will now run once per row; use `SET` first for once-per-page execution
+  - `SELECT sqlpage.random_string(8) AS token FROM many_rows` now produces one token per row instead of one token reused across rows
+  - `SET result = (SELECT sqlpage.fetch($url) WHERE NOT $cached)` now works as expected and does not re-fetch a cached result. Apps relying on sqlite-specific `SET x = (SELECT y FROM t)` first-row behavior should add `LIMIT 1` and select exactly one column.
 - **Access logs now go to stdout.** SQLPage now writes the single per-request completion log line to stdout with the target `sqlpage::access`, matching common application-server and container logging conventions. Diagnostic logs, warnings, and internal errors still go to stderr. If your `LOG_LEVEL` or `RUST_LOG` filter is scoped to a specific old target such as `sqlpage::webserver::http=info`, add `sqlpage::access=info` so request-completion logs are still emitted. If your log pipeline only collects stderr, update it to collect stdout too.
 
 ## v0.44.1
