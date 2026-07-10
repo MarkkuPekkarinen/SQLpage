@@ -129,13 +129,13 @@ fn preserves_null_concat_semantics(function: &Function) -> bool {
 }
 
 fn function_arg_is_concat(arg: &FunctionArg) -> bool {
-    let expr = match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-        | FunctionArg::Named {
-            arg: FunctionArgExpr::Expr(expr),
-            ..
-        } => expr,
-        _ => return false,
+    let (FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+    | FunctionArg::Named {
+        arg: FunctionArgExpr::Expr(expr),
+        ..
+    }) = arg
+    else {
+        return false;
     };
 
     match expr {
