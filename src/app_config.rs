@@ -8,7 +8,7 @@ use openidconnect::IssuerUrl;
 use percent_encoding::AsciiSet;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -138,6 +138,27 @@ impl AppConfig {
             validate_smtp_host(smtp_host)?;
         }
         anyhow::ensure!(
+            self.smtp_host.is_some()
+                || (self.smtp_port.is_none()
+                    && self.smtp_username.is_none()
+                    && self.smtp_password.is_none()
+                    && self.smtp_from.is_none()),
+            "smtp_host is required when other SMTP options are configured"
+        );
+        anyhow::ensure!(
+            self.smtp_port != Some(0),
+            "smtp_port must be between 1 and 65535"
+        );
+        anyhow::ensure!(
+            self.smtp_username.is_some() == self.smtp_password.is_some(),
+            "smtp_username and smtp_password must be configured together"
+        );
+        if let Some(smtp_from) = &self.smtp_from {
+            smtp_from
+                .parse::<lettre::message::Mailbox>()
+                .context("smtp_from is not a valid email address")?;
+        }
+        anyhow::ensure!(
             self.smtp_username.is_none() || self.smtp_tls_mode != SmtpTlsMode::None,
             "SMTP credentials require smtp_tls_mode to be 'starttls' or 'tls'"
         );
@@ -230,8 +251,10 @@ pub struct AppConfig {
     pub allow_exec: bool,
 
     /// SMTP server host used by the `sqlpage.send_mail` function.
-    /// Accepts either a bare host name or `host:port`. Defaults to port 25 when no port is specified.
     pub smtp_host: Option<String>,
+
+    /// SMTP server port. Defaults to 25 for plaintext, 465 for implicit TLS, and 587 for STARTTLS.
+    pub smtp_port: Option<u16>,
 
     /// Optional SMTP user name used by the `sqlpage.send_mail` function.
     /// If set, `SQLPage` authenticates to `SMTP_HOST` with this user name and `smtp_password`.
@@ -239,6 +262,9 @@ pub struct AppConfig {
 
     /// Optional SMTP password used by the `sqlpage.send_mail` function when `smtp_username` is set.
     pub smtp_password: Option<String>,
+
+    /// Default sender used by the `sqlpage.send_mail` function when the message has no `from` property.
+    pub smtp_from: Option<String>,
 
     /// Encryption mode used to connect to `SMTP_HOST`.
     #[serde(default)]
@@ -554,22 +580,16 @@ fn default_site_prefix() -> String {
     '/'.to_string()
 }
 
-pub(crate) fn parse_smtp_host(smtp_host: &str) -> anyhow::Result<(&str, u16)> {
-    let (host, port) = smtp_host
-        .rsplit_once(':')
-        .map_or((smtp_host, 25), |(host, port)| {
-            (host, port.parse::<u16>().unwrap_or(0))
-        });
+fn validate_smtp_host(host: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        !host.is_empty() && !host.contains('/') && !host.contains(':'),
-        "SMTP_HOST must be a host name or host:port, without a URL scheme or path"
+        !host.trim().is_empty()
+            && host.trim() == host
+            && !host.contains('/')
+            && !host.contains("://")
+            && (!host.contains(':') || host.parse::<IpAddr>().is_ok()),
+        "smtp_host must be a host name or IP address, without a URL scheme, path, or surrounding whitespace"
     );
-    anyhow::ensure!(port > 0, "SMTP_HOST port must be between 1 and 65535");
-    Ok((host, port))
-}
-
-fn validate_smtp_host(smtp_host: &str) -> anyhow::Result<()> {
-    parse_smtp_host(smtp_host).map(|_| ())
+    Ok(())
 }
 
 fn parse_socket_addr(host_str: &str) -> anyhow::Result<SocketAddr> {
@@ -730,6 +750,15 @@ pub enum SmtpTlsMode {
     Starttls,
     Tls,
 }
+impl SmtpTlsMode {
+    pub(crate) const fn default_port(self) -> u16 {
+        match self {
+            Self::None => 25,
+            Self::Starttls => 587,
+            Self::Tls => 465,
+        }
+    }
+}
 impl DevOrProd {
     pub(crate) fn is_prod(self) -> bool {
         self == DevOrProd::Production
@@ -802,11 +831,23 @@ mod test {
     #[test]
     fn smtp_credentials_require_tls() {
         let mut config = tests::test_config();
+        config.smtp_host = Some("smtp.example.com".to_string());
         config.smtp_username = Some("user".to_string());
+        config.smtp_password = Some("secret".to_string());
         config.smtp_tls_mode = SmtpTlsMode::None;
 
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("SMTP credentials require smtp_tls_mode"));
+    }
+
+    #[test]
+    fn smtp_credentials_must_be_configured_together() {
+        let mut config = tests::test_config();
+        config.smtp_host = Some("smtp.example.com".to_string());
+        config.smtp_username = Some("user".to_string());
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("smtp_username and smtp_password"));
     }
 
     #[test]

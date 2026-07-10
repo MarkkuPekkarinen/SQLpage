@@ -6,70 +6,65 @@ use lettre::{
     message::{Mailbox, header::ContentType},
     transport::smtp::{
         authentication::Credentials,
-        client::{Tls, TlsParameters},
+        client::{Certificate, CertificateStore, Tls, TlsParameters},
     },
 };
 use serde::Deserialize;
 
 use crate::{
-    app_config::{AppConfig, SmtpTlsMode, parse_smtp_host},
-    webserver::http_request_info::RequestInfo,
+    app_config::{AppConfig, SmtpTlsMode},
+    webserver::{http_client::native_certificate_der, http_request_info::RequestInfo},
 };
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MailRequest<'a> {
     #[serde(borrow)]
-    recipient: Cow<'a, str>,
+    to: Cow<'a, str>,
     #[serde(borrow)]
     subject: Cow<'a, str>,
     #[serde(borrow)]
     body: Cow<'a, str>,
-    #[serde(borrow, default)]
-    sender: Option<Cow<'a, str>>,
+    #[serde(borrow, default, rename = "from")]
+    from: Option<Cow<'a, str>>,
     #[serde(borrow, default)]
     reply_to: Option<Cow<'a, str>>,
 }
 
-/// Sends an email through the SMTP server configured with `SMTP_HOST`.
-pub(super) async fn send_mail<'a>(
+/// Sends an email through the configured SMTP relay.
+pub(super) async fn send_mail(
     request: &RequestInfo,
-    mail_request: Option<Cow<'a, str>>,
-) -> anyhow::Result<Option<Cow<'a, str>>> {
-    send_mail_with_config(&request.app_state.config, mail_request).await
+    mail_request: Cow<'_, str>,
+) -> anyhow::Result<()> {
+    send_mail_with_config(&request.app_state.config, &mail_request).await
 }
 
-async fn send_mail_with_config<'a>(
-    config: &AppConfig,
-    mail_request: Option<Cow<'a, str>>,
-) -> anyhow::Result<Option<Cow<'a, str>>> {
-    let Some(mail_request) = mail_request else {
-        return Ok(None);
-    };
-    let smtp_host = config
+async fn send_mail_with_config(config: &AppConfig, mail_request: &str) -> anyhow::Result<()> {
+    let host = config
         .smtp_host
         .as_deref()
-        .context("The sqlpage.send_mail() function requires the SMTP_HOST configuration option")?;
-    let (host, port) = parse_smtp_host(smtp_host)?;
-    let parsed_mail_request: MailRequest<'_> = serde_json::from_str(&mail_request)
-        .context("sqlpage.send_mail() expects a JSON object argument")?;
+        .context("sqlpage.send_mail() requires the smtp_host configuration option")?;
+    let parsed: MailRequest<'_> = serde_json::from_str(mail_request)
+        .context("sqlpage.send_mail() expects a JSON object")?;
 
-    let sender = parsed_mail_request
-        .sender
+    let sender = parsed
+        .from
         .as_deref()
-        .unwrap_or("SQLPage <sqlpage@localhost>")
+        .or(config.smtp_from.as_deref())
+        .context("Email has no from address; set its from property or configure smtp_from")?
         .parse::<Mailbox>()
-        .context("Invalid sender email address")?;
-    let recipient = parsed_mail_request
-        .recipient
+        .context("Invalid from email address")?;
+    let recipient = parsed
+        .to
         .parse::<Mailbox>()
-        .context("Invalid recipient email address")?;
+        .context("Invalid to email address")?;
 
     let mut email = Message::builder()
         .from(sender)
         .to(recipient)
-        .subject(parsed_mail_request.subject.as_ref())
+        .subject(parsed.subject.as_ref())
         .header(ContentType::TEXT_PLAIN);
-    if let Some(reply_to) = parsed_mail_request.reply_to {
+    if let Some(reply_to) = parsed.reply_to {
         email = email.reply_to(
             reply_to
                 .parse::<Mailbox>()
@@ -77,39 +72,59 @@ async fn send_mail_with_config<'a>(
         );
     }
     let email = email
-        .body(parsed_mail_request.body.into_owned())
+        .body(parsed.body.into_owned())
         .context("Unable to build email message")?;
 
-    let tls = match config.smtp_tls_mode {
-        SmtpTlsMode::None => Tls::None,
-        SmtpTlsMode::Starttls => Tls::Required(
-            TlsParameters::new(host.to_string()).context("Invalid SMTP TLS server name")?,
-        ),
-        SmtpTlsMode::Tls => Tls::Wrapper(
-            TlsParameters::new(host.to_string()).context("Invalid SMTP TLS server name")?,
-        ),
-    };
-    let mut mailer_builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
+    let tls = smtp_tls(config, host)?;
+    let port = config
+        .smtp_port
+        .unwrap_or_else(|| config.smtp_tls_mode.default_port());
+    let mut mailer = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
         .port(port)
         .tls(tls);
-    if let Some(username) = &config.smtp_username {
-        mailer_builder = mailer_builder.credentials(Credentials::new(
-            username.clone(),
-            config.smtp_password.clone().unwrap_or_default(),
-        ));
+    if let (Some(username), Some(password)) = (&config.smtp_username, &config.smtp_password) {
+        mailer = mailer.credentials(Credentials::new(username.clone(), password.clone()));
     }
-    let mailer = mailer_builder.build();
-    mailer
+
+    let response = mailer
+        .build()
         .send(email)
         .await
-        .with_context(|| format!("Unable to send email through {smtp_host}"))?;
-    Ok(Some(mail_request))
+        .with_context(|| format!("Unable to send email through {host}:{port}"))?;
+    log::debug!("SMTP relay accepted email: {response:?}");
+    Ok(())
+}
+
+fn smtp_tls(config: &AppConfig, host: &str) -> anyhow::Result<Tls> {
+    if config.smtp_tls_mode == SmtpTlsMode::None {
+        return Ok(Tls::None);
+    }
+
+    let mut parameters = TlsParameters::builder(host.to_string());
+    if config.system_root_ca_certificates {
+        parameters = parameters.certificate_store(CertificateStore::None);
+        for certificate in native_certificate_der()? {
+            parameters = parameters.add_root_certificate(
+                Certificate::from_der(certificate.as_ref().to_vec())
+                    .context("Unable to configure an SMTP root certificate")?,
+            );
+        }
+    } else {
+        parameters = parameters.certificate_store(CertificateStore::WebpkiRoots);
+    }
+    let parameters = parameters
+        .build_rustls()
+        .context("Unable to configure SMTP TLS")?;
+    Ok(match config.smtp_tls_mode {
+        SmtpTlsMode::Starttls => Tls::Required(parameters),
+        SmtpTlsMode::Tls => Tls::Wrapper(parameters),
+        SmtpTlsMode::None => unreachable!(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        borrow::Cow,
         io::{BufRead, BufReader, Write},
         net::{TcpListener, TcpStream},
         sync::mpsc,
@@ -120,72 +135,63 @@ mod tests {
     use crate::app_config::tests::test_config;
 
     #[tokio::test]
-    async fn send_mail_authenticates_to_plaintext_smtp_server_when_explicitly_enabled() {
-        let (host, received) = start_authenticated_smtp_server("user", "secret");
+    async fn sends_plain_text_email_to_configured_relay() {
+        let (host, port, received) = start_smtp_server();
         let mut config = test_config();
         config.smtp_host = Some(host);
-        config.smtp_username = Some("user".to_string());
-        config.smtp_password = Some("secret".to_string());
+        config.smtp_port = Some(port);
         config.smtp_tls_mode = SmtpTlsMode::None;
 
-        let mail_request = Cow::Borrowed(
-            r#"{
-                "recipient": "admin@example.com",
-                "sender": "contact@example.com",
-                "subject": "Authenticated SMTP",
-                "body": "hello authenticated smtp"
-            }"#,
-        );
-        let result = send_mail_with_config(
+        send_mail_with_config(
             &config,
-            Some(mail_request.clone()),
+            r#"{
+                "to": "admin@example.com",
+                "from": "contact@example.com",
+                "subject": "SMTP test",
+                "body": "hello smtp"
+            }"#,
         )
         .await
         .unwrap();
 
-        assert_eq!(result, Some(mail_request));
-        let smtp_session = received.recv().unwrap();
-        assert!(smtp_session.authenticated, "SMTP AUTH was not used");
-        assert!(smtp_session.data.contains("Authenticated SMTP"));
-        assert!(smtp_session.data.contains("hello authenticated smtp"));
+        let data = received.recv().unwrap();
+        assert!(data.contains("Subject: SMTP test"));
+        assert!(data.contains("hello smtp"));
     }
 
-    struct SmtpSession {
-        authenticated: bool,
-        data: String,
+    #[tokio::test]
+    async fn rejects_unknown_message_fields() {
+        let mut config = test_config();
+        config.smtp_host = Some("localhost".to_string());
+        let error = send_mail_with_config(
+            &config,
+            r#"{"recipient":"admin@example.com","subject":"test","body":"hello"}"#,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("expects a JSON object"));
     }
 
-    fn start_authenticated_smtp_server(username: &str, password: &str) -> (String, mpsc::Receiver<SmtpSession>) {
+    fn start_smtp_server() -> (String, u16, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let username = username.to_string();
-        let password = password.to_string();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let session = handle_smtp_connection(stream, &username, &password);
-            sender.send(session).unwrap();
+            sender.send(handle_smtp_connection(stream)).unwrap();
         });
-        (address.to_string(), receiver)
+        (address.ip().to_string(), address.port(), receiver)
     }
 
-    fn handle_smtp_connection(mut stream: TcpStream, username: &str, password: &str) -> SmtpSession {
+    fn handle_smtp_connection(mut stream: TcpStream) -> String {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         write_response(&mut stream, "220 localhost ESMTP test server");
-        let mut authenticated = false;
         let mut data = String::new();
         loop {
             let line = read_line(&mut reader);
             let command = line.trim_end_matches(['\r', '\n']);
             if command.starts_with("EHLO") || command.starts_with("HELO") {
-                write!(
-                    stream,
-                    "250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n"
-                )
-                .unwrap();
-            } else if let Some(auth) = command.strip_prefix("AUTH PLAIN ") {
-                authenticated = auth == expected_plain_auth(username, password);
-                write_response(&mut stream, if authenticated { "235 Authentication successful" } else { "535 Authentication failed" });
+                write_response(&mut stream, "250 localhost");
             } else if command == "DATA" {
                 write_response(&mut stream, "354 End data with <CR><LF>.<CR><LF>");
                 loop {
@@ -199,13 +205,11 @@ mod tests {
             } else if command == "QUIT" {
                 write_response(&mut stream, "221 Bye");
                 break;
-            } else if authenticated && (command.starts_with("MAIL FROM") || command.starts_with("RCPT TO")) {
-                write_response(&mut stream, "250 OK");
             } else {
-                write_response(&mut stream, "530 Authentication required");
+                write_response(&mut stream, "250 OK");
             }
         }
-        SmtpSession { authenticated, data }
+        data
     }
 
     fn read_line(reader: &mut BufReader<TcpStream>) -> String {
@@ -216,10 +220,5 @@ mod tests {
 
     fn write_response(stream: &mut TcpStream, response: &str) {
         write!(stream, "{response}\r\n").unwrap();
-    }
-
-    fn expected_plain_auth(username: &str, password: &str) -> String {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
-        STANDARD.encode(format!("\0{username}\0{password}"))
     }
 }
