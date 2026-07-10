@@ -794,6 +794,19 @@ mod test {
     }
 
     #[test]
+    fn test_constant_sqlpage_function_is_not_delayed() {
+        let mut ast =
+            parse_postgres_stmt("select sqlpage.url_encode(concat('/', $value)) as encoded");
+        let functions = extract_delayed_functions_from_query(&mut ast);
+
+        assert!(functions.is_empty());
+        assert_eq!(
+            ast.to_string(),
+            "SELECT sqlpage.url_encode(concat('/', $value)) AS encoded"
+        );
+    }
+
+    #[test]
     fn test_nested_sqlpage_functions_are_not_delayable() {
         let mut ast =
             parse_postgres_stmt("select coalesce(sqlpage.url_encode(url), '') as encoded from t");

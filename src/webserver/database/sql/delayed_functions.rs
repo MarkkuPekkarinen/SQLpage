@@ -4,6 +4,9 @@ use sqlparser::ast::{
 };
 
 use super::{DelayedFunctionCall, SqlPageFunctionName, extract_sqlpage_function_name};
+use crate::webserver::database::sql::parameter_extraction::{
+    ParamExtractContext, function_args_to_stmt_params,
+};
 
 /// The execution of standalone projected `SQLPage` functions is delayed until after
 /// the query has been executed. For instance, `SELECT sqlpage.fetch(x) AS body FROM t`
@@ -12,18 +15,36 @@ use super::{DelayedFunctionCall, SqlPageFunctionName, extract_sqlpage_function_n
 pub(super) fn extract_delayed_functions_from_query(
     stmt: &mut Statement,
 ) -> Vec<DelayedFunctionCall> {
-    let select_items = match stmt {
-        Statement::Query(q) => match q.body.as_mut() {
-            SetExpr::Select(s) => &mut s.projection,
-            _ => return Vec::new(),
-        },
-        _ => return Vec::new(),
-    };
+    match stmt {
+        Statement::Query(q) => {
+            let is_limited = q.limit_clause.is_some() || q.fetch.is_some();
+            let SetExpr::Select(s) = q.body.as_mut() else {
+                return Vec::new();
+            };
 
+            // A constant single-row projection can be evaluated before the query.
+            // Besides avoiding an unnecessary query, this preserves SQLPage's
+            // cross-database argument semantics (notably NULL concatenation).
+            let is_constant_single_row = !is_limited && s.from.is_empty() && s.selection.is_none();
+            extract_delayed_functions_from_projection(&mut s.projection, is_constant_single_row)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn extract_delayed_functions_from_projection(
+    select_items: &mut Vec<SelectItem>,
+    is_constant_single_row: bool,
+) -> Vec<DelayedFunctionCall> {
     let mut delayed_function_calls = Vec::new();
     let mut rewritten_projection = Vec::with_capacity(select_items.len());
     for item in std::mem::take(select_items) {
-        rewrite_select_item(item, &mut rewritten_projection, &mut delayed_function_calls);
+        rewrite_select_item(
+            item,
+            is_constant_single_row,
+            &mut rewritten_projection,
+            &mut delayed_function_calls,
+        );
     }
     *select_items = rewritten_projection;
     delayed_function_calls
@@ -31,6 +52,7 @@ pub(super) fn extract_delayed_functions_from_query(
 
 fn rewrite_select_item(
     item: SelectItem,
+    is_constant_single_row: bool,
     rewritten_projection: &mut Vec<SelectItem>,
     delayed_function_calls: &mut Vec<DelayedFunctionCall>,
 ) {
@@ -39,7 +61,9 @@ fn rewrite_select_item(
             expr: Expr::Function(function),
             alias,
         } => {
-            if let Some(func_name) = delayable_sqlpage_function(&function) {
+            if let Some(func_name) = delayable_sqlpage_function(&function)
+                && (!is_constant_single_row || !can_be_evaluated_before_query(&function))
+            {
                 let (replacement_items, delayed_call) = rewrite_function_projection(
                     function,
                     func_name,
@@ -56,7 +80,9 @@ fn rewrite_select_item(
             }
         }
         SelectItem::UnnamedExpr(Expr::Function(function)) => {
-            if let Some(func_name) = delayable_sqlpage_function(&function) {
+            if let Some(func_name) = delayable_sqlpage_function(&function)
+                && (!is_constant_single_row || !can_be_evaluated_before_query(&function))
+            {
                 let target_col_name = function.to_string();
                 let (replacement_items, delayed_call) = rewrite_function_projection(
                     function,
@@ -94,6 +120,14 @@ fn delayable_sqlpage_function(function: &Function) -> Option<SqlPageFunctionName
         return None;
     }
     Some(func_name)
+}
+
+fn can_be_evaluated_before_query(function: &Function) -> bool {
+    let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
+        return false;
+    };
+    let mut args = args.clone();
+    function_args_to_stmt_params(&mut args, &ParamExtractContext::default()).is_ok()
 }
 
 fn rewrite_function_projection(
