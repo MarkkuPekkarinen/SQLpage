@@ -127,45 +127,6 @@ impl ParameterExtractor {
         }
         false
     }
-
-    fn extract_sqlpage_function_if_possible(&mut self, value: &mut Expr) {
-        let Expr::Function(Function {
-            name: ObjectName(func_name_parts),
-            args:
-                FunctionArguments::List(FunctionArgumentList {
-                    args,
-                    duplicate_treatment: None,
-                    ..
-                }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            ..
-        }) = value
-        else {
-            return;
-        };
-        if !is_sqlpage_func(func_name_parts) {
-            return;
-        }
-
-        let func_name = sqlpage_func_name(func_name_parts);
-        log::trace!("Handling builtin function: {func_name}");
-        let arguments = std::mem::take(args);
-        let ctx = ParamExtractContext::with_extracted_params(
-            func_name,
-            &self.parameters,
-            self.db_info.kind,
-        );
-        let mut arguments_clone = arguments.clone();
-        let param = func_call_to_param(func_name, &mut arguments_clone, &ctx);
-        if let StmtParam::Error(msg) = &param {
-            log::trace!("Skipping extraction of {func_name} due to: {msg}");
-            *args = arguments;
-            return;
-        }
-        self.replace_with_placeholder(value, param);
-    }
 }
 
 struct InvalidFunctionFinder;
@@ -196,7 +157,9 @@ impl Visitor for InvalidFunctionFinder {
 pub(super) fn validate_function_calls(stmt: &Statement) -> anyhow::Result<()> {
     let mut finder = InvalidFunctionFinder;
     if let ControlFlow::Break((func_name, mut args)) = stmt.visit(&mut finder) {
-        let ctx = ParamExtractContext::with_parent(&func_name);
+        let ctx = ParamExtractContext {
+            parent_func: Some(func_name.clone()),
+        };
         function_args_to_stmt_params(&mut args, &ctx)?;
 
         let args_str = FormatArguments(&args);
@@ -239,30 +202,13 @@ impl std::fmt::Display for FormatArguments<'_> {
 #[derive(Clone, Default)]
 pub(crate) struct ParamExtractContext {
     pub parent_func: Option<String>,
-    extracted_params: Vec<StmtParam>,
-    placeholder_prefix: Option<&'static str>,
 }
 
 impl ParamExtractContext {
     fn with_parent(parent: &str) -> Self {
         Self {
             parent_func: Some(parent.to_string()),
-            ..Self::default()
         }
-    }
-
-    fn with_extracted_params(parent: &str, extracted_params: &[StmtParam], kind: AnyKind) -> Self {
-        Self {
-            parent_func: Some(parent.to_string()),
-            extracted_params: extracted_params.to_vec(),
-            placeholder_prefix: Some(get_placeholder_prefix(kind)),
-        }
-    }
-
-    fn extracted_param_for_placeholder(&self, placeholder: &str) -> Option<StmtParam> {
-        let prefix = self.placeholder_prefix?;
-        let index = placeholder.strip_prefix(prefix)?.parse::<usize>().ok()?;
-        self.extracted_params.get(index.checked_sub(1)?).cloned()
     }
 
     fn build_error(&self, e: &ExprToParamError, arguments: &[FunctionArg]) -> SqlPageFunctionError {
@@ -389,10 +335,8 @@ fn emulated_func_args_to_param(
     func_name: &str,
     args: &mut [FunctionArg],
     line: u64,
-    ctx: &ParamExtractContext,
 ) -> Result<StmtParam, ExprToParamError> {
-    let mut inner = ctx.clone();
-    inner.parent_func = Some(func_name.to_string());
+    let inner = ParamExtractContext::with_parent(func_name);
     if func_name.eq_ignore_ascii_case("concat") {
         let mut concat_args = Vec::with_capacity(args.len());
         for a in args {
@@ -444,13 +388,7 @@ fn expr_to_stmt_param(
         Expr::Value(ValueWithSpan {
             value: Value::Placeholder(placeholder),
             ..
-        }) => {
-            if let Some(param) = ctx.extracted_param_for_placeholder(placeholder) {
-                Ok(param)
-            } else {
-                Ok(map_param(std::mem::take(placeholder)))
-            }
-        }
+        }) => Ok(map_param(std::mem::take(placeholder))),
         Expr::Identifier(ident) => extract_ident_param(ident).ok_or_else(|| ExprToParamError {
             line: Some(line),
             kind: ExprToParamErrorKind::UnsupportedExpr {
@@ -482,13 +420,6 @@ fn expr_to_stmt_param(
         Expr::Value(ValueWithSpan {
             value: Value::Null, ..
         }) => Ok(StmtParam::Null),
-        Expr::Cast {
-            expr,
-            data_type: DataType::Text | DataType::Varchar(_) | DataType::Char(_),
-            format: None,
-            kind: CastKind::Cast,
-            ..
-        } => expr_to_stmt_param(expr, ctx),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::StringConcat,
@@ -512,7 +443,7 @@ fn expr_to_stmt_param(
                 .as_ident()
                 .map(|ident| ident.value.as_str())
                 .unwrap_or_default();
-            emulated_func_args_to_param(func_name, args.as_mut_slice(), line, ctx)
+            emulated_func_args_to_param(func_name, args.as_mut_slice(), line)
         }
         _ => Err(ExprToParamError {
             line: Some(line),
@@ -582,7 +513,34 @@ impl VisitorMut for ParameterExtractor {
                 let name = std::mem::take(param);
                 self.replace_with_placeholder(value, map_param(name));
             }
-            Expr::Function(..) => self.extract_sqlpage_function_if_possible(value),
+            Expr::Function(Function {
+                name: ObjectName(func_name_parts),
+                args:
+                    FunctionArguments::List(FunctionArgumentList {
+                        args,
+                        duplicate_treatment: None,
+                        ..
+                    }),
+                filter: None,
+                null_treatment: None,
+                over: None,
+                ..
+            }) if is_sqlpage_func(func_name_parts) => {
+                let func_name = sqlpage_func_name(func_name_parts);
+                log::trace!("Handling builtin function: {func_name}");
+                let arguments = std::mem::take(args);
+                let ctx = ParamExtractContext {
+                    parent_func: Some(func_name.to_string()),
+                };
+                let mut arguments_clone = arguments.clone();
+                let param = func_call_to_param(func_name, &mut arguments_clone, &ctx);
+                if let StmtParam::Error(msg) = &param {
+                    log::trace!("Skipping extraction of {func_name} due to: {msg}");
+                    *args = arguments;
+                    return ControlFlow::Continue(());
+                }
+                self.replace_with_placeholder(value, param);
+            }
             // Replace 'str1' || 'str2' with CONCAT('str1', 'str2') for MSSQL
             Expr::BinaryOp {
                 left,
@@ -628,11 +586,6 @@ impl VisitorMut for ParameterExtractor {
             }
             _ => (),
         }
-        ControlFlow::<()>::Continue(())
-    }
-
-    fn post_visit_expr(&mut self, value: &mut Expr) -> ControlFlow<Self::Break> {
-        self.extract_sqlpage_function_if_possible(value);
         ControlFlow::<()>::Continue(())
     }
 }
