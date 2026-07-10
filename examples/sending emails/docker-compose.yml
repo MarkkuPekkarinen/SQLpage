@@ -3,5 +3,15 @@ services:
     image: lovasoa/sqlpage:main
     ports:
       - "8080:8080"
+    environment:
+      SMTP_HOST: mailpit:1025
+      SMTP_TLS_MODE: none
     volumes:
       - .:/var/www
+    depends_on:
+      - mailpit
+
+  mailpit:
+    image: axllent/mailpit:v1.30.4
+    ports:
+      - "8025:8025"

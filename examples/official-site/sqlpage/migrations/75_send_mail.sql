@@ -9,11 +9,13 @@ VALUES (
         'send_mail',
         '0.45.0',
         'mail',
-        'Sends an email using the SMTP server configured with `STMP_HOST`.
+        'Sends an email using the SMTP server configured with `SMTP_HOST`.
 
-`STMP_HOST` must contain only a host name or `host:port`; URL schemes and paths are rejected. When no port is specified, SQLPage uses port 25.
+`SMTP_HOST` must contain only a host name or `host:port`; URL schemes and paths are rejected. When no port is specified, SQLPage uses port 25.
 
-If your SMTP server requires authentication, configure `STMP_USERNAME` and `STMP_PASSWORD` as well.
+`SMTP_TLS_MODE` defaults to `starttls`, which requires a STARTTLS upgrade before sending email or credentials. Set it to `tls` for implicit TLS, commonly used on port 465. Plaintext mode (`none`) is allowed only without credentials and should be used only for trusted local SMTP servers.
+
+If your SMTP server requires authentication, configure `SMTP_USERNAME` and `SMTP_PASSWORD` as well.
 
 The function accepts a single JSON object argument. The required properties are:
 
@@ -26,17 +28,18 @@ Optional properties:
 - `sender`: sender address. Defaults to `SQLPage <sqlpage@localhost>`.
 - `reply_to`: reply-to address.
 
-The function returns `sent` after the SMTP server accepts the message, and `NULL` when passed `NULL`.
+After the SMTP server accepts the message, the function returns its JSON argument unchanged. It returns `NULL` when passed `NULL`, and raises an error if the message cannot be sent.
 
 ### Example
 
 ```sql
-select sqlpage.send_mail(json_object(
+set message = json_object(
     ''recipient'', ''admin@example.com'',
     ''sender'', ''contact@example.com'',
     ''subject'', ''New contact form message'',
     ''body'', ''Hello from SQLPage!''
-));
+);
+select sqlpage.send_mail($message);
 ```
 
 ### Contact form example
@@ -46,16 +49,17 @@ select ''form'' as component, ''post'' as method;
 select ''email'' as name, ''email'' as type, true as required;
 select ''message'' as name, ''textarea'' as type, true as required;
 
-select sqlpage.send_mail(json_object(
+set mail = json_object(
     ''recipient'', ''admin@example.com'',
     ''reply_to'', $email,
     ''subject'', ''Website contact form'',
     ''body'', $message
-))
+);
+select sqlpage.send_mail($mail)
 where $message is not null;
 ```
 ',
-        'TEXT'
+        'JSON'
     );
 
 INSERT INTO sqlpage_function_parameters (

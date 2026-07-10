@@ -134,9 +134,13 @@ impl AppConfig {
         }
         anyhow::ensure!(self.max_pending_rows > 0, "max_pending_rows cannot be null");
 
-        if let Some(stmp_host) = &self.stmp_host {
-            validate_stmp_host(stmp_host)?;
+        if let Some(smtp_host) = &self.smtp_host {
+            validate_smtp_host(smtp_host)?;
         }
+        anyhow::ensure!(
+            self.smtp_username.is_none() || self.smtp_tls_mode != SmtpTlsMode::None,
+            "SMTP credentials require smtp_tls_mode to be 'starttls' or 'tls'"
+        );
 
         for path in &self.oidc_protected_paths {
             if !path.starts_with('/') {
@@ -227,14 +231,18 @@ pub struct AppConfig {
 
     /// SMTP server host used by the `sqlpage.send_mail` function.
     /// Accepts either a bare host name or `host:port`. Defaults to port 25 when no port is specified.
-    pub stmp_host: Option<String>,
+    pub smtp_host: Option<String>,
 
     /// Optional SMTP user name used by the `sqlpage.send_mail` function.
-    /// If set, `SQLPage` authenticates to `STMP_HOST` with this user name and `stmp_password`.
-    pub stmp_username: Option<String>,
+    /// If set, `SQLPage` authenticates to `SMTP_HOST` with this user name and `smtp_password`.
+    pub smtp_username: Option<String>,
 
-    /// Optional SMTP password used by the `sqlpage.send_mail` function when `stmp_username` is set.
-    pub stmp_password: Option<String>,
+    /// Optional SMTP password used by the `sqlpage.send_mail` function when `smtp_username` is set.
+    pub smtp_password: Option<String>,
+
+    /// Encryption mode used to connect to `SMTP_HOST`.
+    #[serde(default)]
+    pub smtp_tls_mode: SmtpTlsMode,
 
     /// Maximum size of uploaded files in bytes. The default is 10MiB (10 * 1024 * 1024 bytes)
     #[serde(default = "default_max_file_size")]
@@ -546,22 +554,22 @@ fn default_site_prefix() -> String {
     '/'.to_string()
 }
 
-pub(crate) fn parse_stmp_host(stmp_host: &str) -> anyhow::Result<(&str, u16)> {
-    let (host, port) = stmp_host
+pub(crate) fn parse_smtp_host(smtp_host: &str) -> anyhow::Result<(&str, u16)> {
+    let (host, port) = smtp_host
         .rsplit_once(':')
-        .map_or((stmp_host, 25), |(host, port)| {
+        .map_or((smtp_host, 25), |(host, port)| {
             (host, port.parse::<u16>().unwrap_or(0))
         });
     anyhow::ensure!(
         !host.is_empty() && !host.contains('/') && !host.contains(':'),
-        "STMP_HOST must be a host name or host:port, without a URL scheme or path"
+        "SMTP_HOST must be a host name or host:port, without a URL scheme or path"
     );
-    anyhow::ensure!(port > 0, "STMP_HOST port must be between 1 and 65535");
+    anyhow::ensure!(port > 0, "SMTP_HOST port must be between 1 and 65535");
     Ok((host, port))
 }
 
-fn validate_stmp_host(stmp_host: &str) -> anyhow::Result<()> {
-    parse_stmp_host(stmp_host).map(|_| ())
+fn validate_smtp_host(smtp_host: &str) -> anyhow::Result<()> {
+    parse_smtp_host(smtp_host).map(|_| ())
 }
 
 fn parse_socket_addr(host_str: &str) -> anyhow::Result<SocketAddr> {
@@ -713,6 +721,15 @@ pub enum DevOrProd {
     Development,
     Production,
 }
+
+#[derive(Debug, Deserialize, PartialEq, Clone, Copy, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpTlsMode {
+    None,
+    #[default]
+    Starttls,
+    Tls,
+}
 impl DevOrProd {
     pub(crate) fn is_prod(self) -> bool {
         self == DevOrProd::Production
@@ -775,6 +792,21 @@ mod test {
     #[test]
     fn test_default_site_prefix() {
         assert_eq!(default_site_prefix(), "/".to_string());
+    }
+
+    #[test]
+    fn smtp_defaults_to_starttls() {
+        assert_eq!(tests::test_config().smtp_tls_mode, SmtpTlsMode::Starttls);
+    }
+
+    #[test]
+    fn smtp_credentials_require_tls() {
+        let mut config = tests::test_config();
+        config.smtp_username = Some("user".to_string());
+        config.smtp_tls_mode = SmtpTlsMode::None;
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("SMTP credentials require smtp_tls_mode"));
     }
 
     #[test]
