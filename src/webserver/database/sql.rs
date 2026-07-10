@@ -900,6 +900,44 @@ mod test {
     }
 
     #[test]
+    fn test_request_param_in_nested_sqlpage_function_arg() {
+        let sql = "select coalesce(sqlpage.url_encode(json_object('recipient', :recipient)), '') as value";
+        for &(dialect, dbms) in ALL_DIALECTS {
+            let db_info = create_test_db_info(dbms);
+            let mut parsed = parse_sql(&db_info, dialect, sql).unwrap();
+            let stmt = parsed.next().expect("one statement");
+            let ParsedStatement::StmtWithParams(StmtWithParams {
+                query,
+                params,
+                delayed_functions,
+                ..
+            }) = stmt
+            else {
+                panic!("expected ParsedStatement::StmtWithParams for {dialect:?}: {stmt:?}");
+            };
+            assert_eq!(
+                params,
+                [StmtParam::FunctionCall(SqlPageFunctionCall {
+                    function: SqlPageFunctionName::url_encode,
+                    arguments: vec![StmtParam::JsonObject(vec![
+                        StmtParam::Literal("recipient".to_string()),
+                        StmtParam::Post("recipient".to_string())
+                    ])]
+                })],
+                "Failed for dialect {dialect:?}"
+            );
+            assert!(
+                delayed_functions.is_empty(),
+                "Failed for dialect {dialect:?}"
+            );
+            assert!(
+                !query.contains("sqlpage.url_encode"),
+                "Failed for dialect {dialect:?}: {query}"
+            );
+        }
+    }
+
+    #[test]
     fn test_set_variable_to_other_variable() {
         let sql = "set x = $y";
         for &(dialect, dbms) in ALL_DIALECTS {
