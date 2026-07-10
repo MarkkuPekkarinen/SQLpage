@@ -22,9 +22,6 @@ pub(super) fn extract_delayed_functions_from_query(
                 return Vec::new();
             };
 
-            // A constant single-row projection can be evaluated before the query.
-            // Besides avoiding an unnecessary query, this preserves SQLPage's
-            // cross-database argument semantics (notably NULL concatenation).
             let is_constant_single_row = !is_limited && s.from.is_empty() && s.selection.is_none();
             extract_delayed_functions_from_projection(&mut s.projection, is_constant_single_row)
         }
@@ -62,7 +59,7 @@ fn rewrite_select_item(
             alias,
         } => {
             if let Some(func_name) = delayable_sqlpage_function(&function)
-                && (!is_constant_single_row || !can_be_evaluated_before_query(&function))
+                && (!is_constant_single_row || !preserves_null_concat_semantics(&function))
             {
                 let (replacement_items, delayed_call) = rewrite_function_projection(
                     function,
@@ -81,7 +78,7 @@ fn rewrite_select_item(
         }
         SelectItem::UnnamedExpr(Expr::Function(function)) => {
             if let Some(func_name) = delayable_sqlpage_function(&function)
-                && (!is_constant_single_row || !can_be_evaluated_before_query(&function))
+                && (!is_constant_single_row || !preserves_null_concat_semantics(&function))
             {
                 let target_col_name = function.to_string();
                 let (replacement_items, delayed_call) = rewrite_function_projection(
@@ -122,12 +119,41 @@ fn delayable_sqlpage_function(function: &Function) -> Option<SqlPageFunctionName
     Some(func_name)
 }
 
-fn can_be_evaluated_before_query(function: &Function) -> bool {
+fn preserves_null_concat_semantics(function: &Function) -> bool {
     let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
         return false;
     };
     let mut args = args.clone();
-    function_args_to_stmt_params(&mut args, &ParamExtractContext::default()).is_ok()
+    let has_concat = args.iter().any(function_arg_is_concat);
+    has_concat && function_args_to_stmt_params(&mut args, &ParamExtractContext::default()).is_ok()
+}
+
+fn function_arg_is_concat(arg: &FunctionArg) -> bool {
+    let expr = match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+        | FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(expr),
+            ..
+        } => expr,
+        _ => return false,
+    };
+
+    match expr {
+        Expr::BinaryOp {
+            op: sqlparser::ast::BinaryOperator::StringConcat,
+            ..
+        } => true,
+        Expr::Function(Function {
+            name: ObjectName(parts),
+            ..
+        }) => {
+            parts.len() == 1
+                && parts[0]
+                    .as_ident()
+                    .is_some_and(|ident| ident.value.eq_ignore_ascii_case("concat"))
+        }
+        _ => false,
+    }
 }
 
 fn rewrite_function_projection(
