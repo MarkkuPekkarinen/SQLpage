@@ -12,6 +12,7 @@ use super::error_highlighting::{display_stmt_db_error, display_stmt_error};
 use super::sql::{
     DelayedFunctionCall, ParsedSqlFile, ParsedStatement, SimpleSelectValue, StmtWithParams,
 };
+use super::sqlpage_functions::functions::SqlPageFunctionName;
 use crate::dynamic_component::parse_dynamic_rows;
 use crate::utils::add_value_to_map;
 use crate::webserver::ErrorWithStatus;
@@ -171,6 +172,7 @@ impl Database {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Keeps the single-connection statement dispatcher together.
 pub fn stream_query_results_with_conn<'a>(
     sql_file: &'a ParsedSqlFile,
     request: &'a ExecutionContext,
@@ -190,13 +192,19 @@ pub fn stream_query_results_with_conn<'a>(
                         .await
                         .map_err(|e| with_stmt_position(source_file, stmt.query_position, e))?;
                     request.server_timing.record("bind_params");
-                    let connection = take_connection(&request.app_state.db, db_connection, request).await?;
                     log::trace!("Executing query {:?}", query.sql);
                     let (query_span, mut query_metrics) = create_query_metrics(request, source_file, stmt, &query);
-                    let mut stream = connection.fetch_many(query);
                     let mut error = None;
                     let mut returned_rows: i64 = 0;
-                    loop {
+                    let defer_functions_until_stream_closed = stmt
+                        .delayed_functions
+                        .iter()
+                        .any(|f| f.function == SqlPageFunctionName::run_sql);
+                    let mut deferred_query_results = Vec::new();
+                    {
+                        let connection = take_connection(&request.app_state.db, db_connection, request).await?;
+                        let mut stream = connection.fetch_many(query);
+                        loop {
                         let start_next = std::time::Instant::now();
                         let next_elem = stream.next().instrument(query_span.clone()).await;
                         query_metrics.add_duration(start_next.elapsed());
@@ -211,19 +219,44 @@ pub fn stream_query_results_with_conn<'a>(
                             returned_rows += 1;
                         }
                         apply_json_columns(&mut query_result, &stmt.json_columns);
-                        if let Err(err) = apply_delayed_functions(request, &stmt.delayed_functions, &mut query_result)
+                        if defer_functions_until_stream_closed {
+                            deferred_query_results.push(query_result);
+                        } else {
+                            if let Err(err) = apply_delayed_functions(request, &stmt.delayed_functions, &mut query_result)
+                                .instrument(query_span.clone())
+                                .await
+                            {
+                                error = Some(err);
+                                break;
+                            }
+                            for db_item in parse_dynamic_rows(query_result) {
+                                yield db_item;
+                            }
+                        }
+                        }
+                        drop(stream);
+                    }
+                    if error.is_none() && defer_functions_until_stream_closed {
+                        for mut query_result in deferred_query_results {
+                            if let Err(err) = apply_delayed_functions_on_connection(
+                                request,
+                                &stmt.delayed_functions,
+                                &mut query_result,
+                                db_connection,
+                            )
                             .instrument(query_span.clone())
                             .await
-                        {
-                            error = Some(err);
-                            break;
-                        }
-                        for db_item in parse_dynamic_rows(query_result) {
-                            yield db_item;
+                            {
+                                error = Some(err);
+                                break;
+                            }
+                            for db_item in parse_dynamic_rows(query_result) {
+                                yield db_item;
+                            }
                         }
                     }
-                    drop(stream);
                     if let Some(error) = error {
+                        let connection = take_connection(&request.app_state.db, db_connection, request).await?;
                         let error = record_error_and_rollback(connection, &query_metrics, returned_rows, error).await;
                         yield DbItem::Error(error);
                     } else {
@@ -698,6 +731,26 @@ async fn apply_delayed_functions(
         for f in delayed_functions {
             log::trace!("Applying delayed function {} to {:?}", f.function, results);
             apply_single_delayed_function(request, &mut db_conn, f, results).await?;
+            log::trace!(
+                "Delayed function applied {}. Result: {:?}",
+                f.function,
+                results
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn apply_delayed_functions_on_connection(
+    request: &ExecutionContext,
+    delayed_functions: &[DelayedFunctionCall],
+    item: &mut DbItem,
+    db_connection: &mut DbConn,
+) -> anyhow::Result<()> {
+    if let DbItem::Row(serde_json::Value::Object(results)) = item {
+        for f in delayed_functions {
+            log::trace!("Applying delayed function {} to {:?}", f.function, results);
+            apply_single_delayed_function(request, db_connection, f, results).await?;
             log::trace!(
                 "Delayed function applied {}. Result: {:?}",
                 f.function,
