@@ -216,6 +216,19 @@ fn parse_single_statement(
         return Some(ParsedStatement::CsvImport(csv_import));
     }
 
+    // SQLPage preprocessing is intentionally staged:
+    //
+    // 1. Whole projected `sqlpage.*` calls are moved out of the SQL statement before
+    //    parameter extraction. Their argument expressions stay in the database query
+    //    as ordinary projected columns, and the SQLPage function runs later for each
+    //    returned row. This keeps side-effectful functions deterministic: no row means
+    //    no call.
+    // 2. Remaining `sqlpage.*` calls are pre-query parameters. `ParameterExtractor`
+    //    converts those calls to `StmtParam::FunctionCall` before generic request
+    //    parameters inside the function arguments are rewritten to database
+    //    placeholders.
+    // 3. Any `sqlpage.*` call still present after those two stages is invalid because
+    //    it would have to run inside the database engine.
     let delayed_functions = extract_delayed_functions_from_query(&mut stmt);
 
     let params = match ParameterExtractor::extract_parameters(&mut stmt, db_info.clone()) {
@@ -439,6 +452,10 @@ fn extract_set_variable(stmt: &mut Statement, db_info: &DbInfo) -> Option<Parsed
         };
         let owned_expr = std::mem::replace(value, Expr::value(Value::Null));
         let mut select_stmt = expr_to_value_query_statement(owned_expr);
+        // Keep SET expression preprocessing aligned with SELECT preprocessing:
+        // first isolate whole-expression SQLPage functions for delayed evaluation,
+        // then extract pre-query SQLPage calls and request parameters, then reject
+        // any SQLPage call that would have to execute inside the database.
         let delayed_functions = extract_delayed_functions_from_query(&mut select_stmt);
         let params = match ParameterExtractor::extract_parameters(&mut select_stmt, db_info.clone())
         {
@@ -804,6 +821,44 @@ mod test {
             ast.to_string(),
             "SELECT sqlpage.url_encode(concat('/', $value)) AS encoded"
         );
+    }
+
+    #[test]
+    fn test_projected_sqlpage_function_with_nested_request_param_is_delayable() {
+        let sql = "select sqlpage.url_encode(json_object('recipient', :recipient))";
+        for &(dialect, dbms) in ALL_DIALECTS {
+            let db_info = create_test_db_info(dbms);
+            let mut parsed = parse_sql(&db_info, dialect, sql).unwrap();
+            let stmt = parsed.next().expect("one statement");
+            let ParsedStatement::StmtWithParams(StmtWithParams {
+                query,
+                params,
+                delayed_functions,
+                ..
+            }) = stmt
+            else {
+                panic!("expected ParsedStatement::StmtWithParams for {dialect:?}: {stmt:?}");
+            };
+            assert_eq!(
+                params,
+                [StmtParam::Post("recipient".to_string())],
+                "Failed for dialect {dialect:?}"
+            );
+            assert_eq!(
+                delayed_functions,
+                [DelayedFunctionCall {
+                    function: SqlPageFunctionName::url_encode,
+                    argument_col_names: vec!["_sqlpage_f0_a0".to_string()],
+                    target_col_name: "sqlpage.url_encode(json_object('recipient', :recipient))"
+                        .to_string()
+                }],
+                "Failed for dialect {dialect:?}"
+            );
+            assert!(
+                !query.contains("sqlpage.url_encode"),
+                "Failed for dialect {dialect:?}: {query}"
+            );
+        }
     }
 
     #[test]
