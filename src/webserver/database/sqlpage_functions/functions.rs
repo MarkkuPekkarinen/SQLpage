@@ -38,6 +38,7 @@ sqlpage_functions! {
     request_body_base64,
     request_method,
     run_sql,
+    send_mail,
     set_variable,
     uploaded_file_mime_type,
     uploaded_file_name,

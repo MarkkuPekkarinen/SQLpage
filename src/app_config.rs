@@ -134,6 +134,10 @@ impl AppConfig {
         }
         anyhow::ensure!(self.max_pending_rows > 0, "max_pending_rows cannot be null");
 
+        if let Some(stmp_host) = &self.stmp_host {
+            validate_stmp_host(stmp_host)?;
+        }
+
         for path in &self.oidc_protected_paths {
             if !path.starts_with('/') {
                 return Err(anyhow::anyhow!(
@@ -220,6 +224,17 @@ pub struct AppConfig {
     /// them the ability to execute arbitrary shell commands on the server.
     #[serde(default)]
     pub allow_exec: bool,
+
+    /// SMTP server host used by the `sqlpage.send_mail` function.
+    /// Accepts either a bare host name or `host:port`. Defaults to port 25 when no port is specified.
+    pub stmp_host: Option<String>,
+
+    /// Optional SMTP user name used by the `sqlpage.send_mail` function.
+    /// If set, `SQLPage` authenticates to `STMP_HOST` with this user name and `stmp_password`.
+    pub stmp_username: Option<String>,
+
+    /// Optional SMTP password used by the `sqlpage.send_mail` function when `stmp_username` is set.
+    pub stmp_password: Option<String>,
 
     /// Maximum size of uploaded files in bytes. The default is 10MiB (10 * 1024 * 1024 bytes)
     #[serde(default = "default_max_file_size")]
@@ -529,6 +544,24 @@ fn test_normalize_site_prefix() {
 
 fn default_site_prefix() -> String {
     '/'.to_string()
+}
+
+pub(crate) fn parse_stmp_host(stmp_host: &str) -> anyhow::Result<(&str, u16)> {
+    let (host, port) = stmp_host
+        .rsplit_once(':')
+        .map_or((stmp_host, 25), |(host, port)| {
+            (host, port.parse::<u16>().unwrap_or(0))
+        });
+    anyhow::ensure!(
+        !host.is_empty() && !host.contains('/') && !host.contains(':'),
+        "STMP_HOST must be a host name or host:port, without a URL scheme or path"
+    );
+    anyhow::ensure!(port > 0, "STMP_HOST port must be between 1 and 65535");
+    Ok((host, port))
+}
+
+fn validate_stmp_host(stmp_host: &str) -> anyhow::Result<()> {
+    parse_stmp_host(stmp_host).map(|_| ())
 }
 
 fn parse_socket_addr(host_str: &str) -> anyhow::Result<SocketAddr> {
