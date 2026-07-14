@@ -270,6 +270,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub smtp_tls_mode: SmtpTlsMode,
 
+    /// Maximum combined decoded size of attachments in one email.
+    #[serde(default = "default_max_email_attachment_size")]
+    pub max_email_attachment_size: usize,
+
     /// Maximum size of uploaded files in bytes. The default is 10MiB (10 * 1024 * 1024 bytes)
     #[serde(default = "default_max_file_size")]
     pub max_uploaded_file_size: usize,
@@ -685,6 +689,10 @@ fn default_web_root() -> PathBuf {
 
 fn default_max_file_size() -> usize {
     5 * 1024 * 1024
+}
+
+fn default_max_email_attachment_size() -> usize {
+    10 * 1024 * 1024
 }
 
 fn default_https_certificate_cache_dir() -> PathBuf {

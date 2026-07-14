@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use anyhow::Context;
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-    message::{Mailbox, header::ContentType},
+    message::{Attachment, Mailbox, MultiPart, SinglePart, header::ContentType},
     transport::smtp::{
         authentication::Credentials,
         client::{Certificate, CertificateStore, Tls, TlsParameters},
@@ -13,14 +13,53 @@ use serde::Deserialize;
 
 use crate::{
     app_config::{AppConfig, SmtpTlsMode},
-    webserver::{http_client::native_certificate_der, http_request_info::RequestInfo},
+    webserver::{
+        database::blob_to_data_url::decode_data_uri, http_client::native_certificate_der,
+        http_request_info::RequestInfo,
+    },
 };
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Recipients {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Recipients {
+    fn parse(self, field: &str) -> anyhow::Result<Vec<Mailbox>> {
+        let recipients = match self {
+            Self::One(recipient) => vec![recipient],
+            Self::Many(recipients) => recipients,
+        };
+        anyhow::ensure!(!recipients.is_empty(), "{field} must not be an empty array");
+        recipients
+            .into_iter()
+            .enumerate()
+            .map(|(index, recipient)| {
+                recipient
+                    .parse::<Mailbox>()
+                    .with_context(|| format!("Invalid {field} email address at index {index}"))
+            })
+            .collect()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailAttachment<'a> {
+    #[serde(borrow)]
+    filename: Cow<'a, str>,
+    #[serde(borrow)]
+    data_url: Cow<'a, str>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MailRequest<'a> {
-    #[serde(borrow)]
-    to: Cow<'a, str>,
+    to: Recipients,
+    #[serde(default)]
+    cc: Option<Recipients>,
     #[serde(borrow)]
     subject: Cow<'a, str>,
     #[serde(borrow)]
@@ -29,6 +68,8 @@ struct MailRequest<'a> {
     from: Option<Cow<'a, str>>,
     #[serde(borrow, default)]
     reply_to: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    attachments: Vec<MailAttachment<'a>>,
 }
 
 /// Sends an email through the configured SMTP relay.
@@ -47,33 +88,7 @@ async fn send_mail_with_config(config: &AppConfig, mail_request: &str) -> anyhow
     let parsed: MailRequest<'_> = serde_json::from_str(mail_request)
         .context("sqlpage.send_mail() expects a JSON object")?;
 
-    let sender = parsed
-        .from
-        .as_deref()
-        .or(config.smtp_from.as_deref())
-        .context("Email has no from address; set its from property or configure smtp_from")?
-        .parse::<Mailbox>()
-        .context("Invalid from email address")?;
-    let recipient = parsed
-        .to
-        .parse::<Mailbox>()
-        .context("Invalid to email address")?;
-
-    let mut email = Message::builder()
-        .from(sender)
-        .to(recipient)
-        .subject(parsed.subject.as_ref())
-        .header(ContentType::TEXT_PLAIN);
-    if let Some(reply_to) = parsed.reply_to {
-        email = email.reply_to(
-            reply_to
-                .parse::<Mailbox>()
-                .context("Invalid reply_to email address")?,
-        );
-    }
-    let email = email
-        .body(parsed.body.into_owned())
-        .context("Unable to build email message")?;
+    let email = build_email(config, parsed)?;
 
     let tls = smtp_tls(config, host)?;
     let port = config
@@ -93,6 +108,82 @@ async fn send_mail_with_config(config: &AppConfig, mail_request: &str) -> anyhow
         .with_context(|| format!("Unable to send email through {host}:{port}"))?;
     log::debug!("SMTP relay accepted email: {response:?}");
     Ok(())
+}
+
+fn build_email(config: &AppConfig, request: MailRequest<'_>) -> anyhow::Result<Message> {
+    let MailRequest {
+        to,
+        cc,
+        subject,
+        body,
+        from,
+        reply_to,
+        attachments,
+    } = request;
+
+    let sender = from
+        .as_deref()
+        .or(config.smtp_from.as_deref())
+        .context("Email has no from address; set its from property or configure smtp_from")?
+        .parse::<Mailbox>()
+        .context("Invalid from email address")?;
+    let mut email = Message::builder()
+        .from(sender)
+        .subject(subject.as_ref());
+    for recipient in to.parse("to")? {
+        email = email.to(recipient);
+    }
+    if let Some(cc) = cc {
+        for recipient in cc.parse("cc")? {
+            email = email.cc(recipient);
+        }
+    }
+    if let Some(reply_to) = reply_to {
+        email = email.reply_to(
+            reply_to
+                .parse::<Mailbox>()
+                .context("Invalid reply_to email address")?,
+        );
+    }
+    if attachments.is_empty() {
+        return email
+            .header(ContentType::TEXT_PLAIN)
+            .body(body.into_owned())
+            .context("Unable to build email message");
+    }
+
+    let mut total_attachment_size = 0usize;
+    let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body.into_owned()));
+    for (index, attachment) in attachments.into_iter().enumerate() {
+        anyhow::ensure!(
+            !attachment.filename.is_empty(),
+            "Attachment filename at index {index} must not be empty"
+        );
+        let (media_type, bytes) = decode_data_uri(&attachment.data_url)
+            .with_context(|| format!("Invalid attachment data_url at index {index}"))?;
+        total_attachment_size = total_attachment_size
+            .checked_add(bytes.len())
+            .context("Total attachment size overflowed")?;
+        anyhow::ensure!(
+            total_attachment_size <= config.max_email_attachment_size,
+            "Attachments exceed max_email_attachment_size of {} bytes",
+            config.max_email_attachment_size
+        );
+        let media_type = if media_type.is_empty() {
+            "application/octet-stream"
+        } else {
+            media_type
+        };
+        let content_type = ContentType::parse(media_type)
+            .with_context(|| format!("Invalid attachment media type at index {index}"))?;
+        multipart = multipart.singlepart(Attachment::new(attachment.filename.into_owned()).body(
+            bytes,
+            content_type,
+        ));
+    }
+    email
+        .multipart(multipart)
+        .context("Unable to build email message")
 }
 
 fn smtp_tls(config: &AppConfig, host: &str) -> anyhow::Result<Tls> {

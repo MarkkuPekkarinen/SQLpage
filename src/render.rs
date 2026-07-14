@@ -358,24 +358,12 @@ impl HeaderContext {
         }
         let data_url = get_object_str(options, "data_url")
             .with_context(|| "The download component requires a 'data_url' property")?;
-        let rest = data_url
-            .strip_prefix("data:")
-            .with_context(|| "Invalid data URL: missing 'data:' prefix")?;
-        let (mut content_type, data) = rest
-            .split_once(',')
-            .with_context(|| "Invalid data URL: missing comma")?;
-        let mut body_bytes: Cow<[u8]> = percent_encoding::percent_decode(data.as_bytes()).into();
-        if let Some(stripped) = content_type.strip_suffix(";base64") {
-            content_type = stripped;
-            body_bytes =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &body_bytes)
-                    .with_context(|| "Invalid base64 data in data URL")?
-                    .into();
-        }
+        let (content_type, body_bytes) =
+            crate::webserver::database::blob_to_data_url::decode_data_uri(data_url)?;
         if !content_type.is_empty() {
             self.insert_header((header::CONTENT_TYPE, content_type))?;
         }
-        self.close_with_body(body_bytes.into_owned())
+        self.close_with_body(body_bytes)
     }
 
     fn log(self, data: &JsonValue) -> anyhow::Result<PageContext> {
