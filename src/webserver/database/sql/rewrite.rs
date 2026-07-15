@@ -26,21 +26,10 @@ use crate::webserver::database::{DbInfo, SupportedDatabase};
 
 const SQLPAGE_INPUT_PREFIX: &str = "__sqlpage_input_";
 
-#[derive(Debug)]
-/// A binding retained with its source position until positional bindings can
-/// be ordered as they appear in the rendered SQL.
-struct PendingBinding {
-    value: StandaloneExpr,
-    sequence: usize,
-}
-
 /// Mutable state used while rewriting one database query.
 struct QueryRewriter<'a> {
     database: &'a DbInfo,
-    bindings: Vec<PendingBinding>,
-    private_bindings: Vec<PendingBinding>,
-    next_binding_sequence: usize,
-    collecting_private_bindings: bool,
+    bindings: Vec<StandaloneExpr>,
     row_input_json: Vec<bool>,
     private_projection: Vec<SelectItem>,
     error: Option<anyhow::Error>,
@@ -125,9 +114,6 @@ pub(super) fn rewrite_query(
     let mut rewriter = QueryRewriter {
         database,
         bindings: Vec::new(),
-        private_bindings: Vec::new(),
-        next_binding_sequence: 0,
-        collecting_private_bindings: false,
         row_input_json: Vec::new(),
         private_projection: Vec::new(),
         error: None,
@@ -139,7 +125,6 @@ pub(super) fn rewrite_query(
         });
     }
     let computed_columns = rewrite_top_level_projection(&mut statement, &mut rewriter)?;
-    rewriter.finish_projection_bindings();
 
     let _ = statement.visit(&mut rewriter);
     if let Some(error) = rewriter.error {
@@ -161,7 +146,7 @@ pub(super) fn rewrite_query(
         .into_iter()
         .filter(|name| !name.starts_with(SQLPAGE_INPUT_PREFIX))
         .collect();
-    let bindings = rewriter.finish_bindings();
+    let bindings = rewriter.finish_bindings(&mut statement)?;
     let sql = format!(
         "{statement}{semicolon}",
         semicolon = if semicolon { ";" } else { "" }
@@ -526,28 +511,18 @@ impl QueryRewriter<'_> {
     }
 
     fn add_binding(&mut self, value: StandaloneExpr) -> SqlExpr {
-        let sequence = self.next_binding_sequence;
-        self.next_binding_sequence += 1;
-        let binding = PendingBinding { value, sequence };
-        if self.collecting_private_bindings {
-            self.private_bindings.push(binding);
-        } else {
-            self.bindings.push(binding);
-        }
+        let sequence = self.bindings.len();
+        self.bindings.push(value);
         let placeholder = match placeholder_style(self.database.kind) {
             PlaceholderStyle::Numbered { prefix } => format!("{prefix}{}", sequence + 1),
-            PlaceholderStyle::Positional { token } => token.to_owned(),
+            PlaceholderStyle::Positional { .. } => format!("${}", sequence + 1),
         };
         cast_placeholder(placeholder, self.database.database_type)
     }
 
     fn add_row_input(&mut self, mut expression: SqlExpr) -> anyhow::Result<RowInputId> {
         let decode_as_json = is_json_expression(&expression);
-        let was_collecting_private_bindings = self.collecting_private_bindings;
-        self.collecting_private_bindings = true;
-        let rewrite_result = self.rewrite_database_expression(&mut expression);
-        self.collecting_private_bindings = was_collecting_private_bindings;
-        rewrite_result?;
+        self.rewrite_database_expression(&mut expression)?;
         let index = self.row_input_json.len();
         let name = format!("{SQLPAGE_INPUT_PREFIX}{index}");
         self.private_projection.push(SelectItem::ExprWithAlias {
@@ -558,23 +533,74 @@ impl QueryRewriter<'_> {
         Ok(RowInputId::new(index))
     }
 
-    fn finish_projection_bindings(&mut self) {
-        self.bindings.append(&mut self.private_bindings);
-    }
-
-    /// Finalizes bindings in database placeholder order. Numbered backends use
-    /// creation order even when private projections move to the trailing suffix.
-    fn finish_bindings(&mut self) -> Box<[StandaloneExpr]> {
-        if matches!(
-            placeholder_style(self.database.kind),
-            PlaceholderStyle::Numbered { .. }
-        ) {
-            self.bindings.sort_by_key(|binding| binding.sequence);
+    fn finish_bindings(
+        &mut self,
+        statement: &mut SqlStatement,
+    ) -> anyhow::Result<Box<[StandaloneExpr]>> {
+        let PlaceholderStyle::Positional { token } = placeholder_style(self.database.kind) else {
+            return Ok(std::mem::take(&mut self.bindings).into_boxed_slice());
+        };
+        let mut finalizer = PositionalBindingFinalizer {
+            token,
+            binding_count: self.bindings.len(),
+            order: Vec::with_capacity(self.bindings.len()),
+            error: None,
+        };
+        let _ = statement.visit(&mut finalizer);
+        if let Some(error) = finalizer.error {
+            return Err(error);
         }
-        std::mem::take(&mut self.bindings)
+        let mut bindings = std::mem::take(&mut self.bindings)
             .into_iter()
-            .map(|binding| binding.value)
-            .collect()
+            .map(Some)
+            .collect::<Vec<_>>();
+        finalizer
+            .order
+            .into_iter()
+            .map(|index| {
+                bindings[index].take().ok_or_else(|| {
+                    anyhow!("Generated binding placeholder ${} was repeated", index + 1)
+                })
+            })
+            .collect::<anyhow::Result<Box<_>>>()
+    }
+}
+
+struct PositionalBindingFinalizer {
+    token: &'static str,
+    binding_count: usize,
+    order: Vec<usize>,
+    error: Option<anyhow::Error>,
+}
+
+impl VisitorMut for PositionalBindingFinalizer {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expression: &mut SqlExpr) -> ControlFlow<Self::Break> {
+        let SqlExpr::Value(ValueWithSpan {
+            value: Value::Placeholder(name),
+            span,
+        }) = expression
+        else {
+            return ControlFlow::Continue(());
+        };
+        if *span != Span::empty() {
+            return ControlFlow::Continue(());
+        }
+        let Some(index) = name
+            .strip_prefix('$')
+            .and_then(|number| number.parse::<usize>().ok())
+            .and_then(|number| number.checked_sub(1))
+        else {
+            return ControlFlow::Continue(());
+        };
+        if index >= self.binding_count {
+            self.error = Some(anyhow!("Invalid generated binding placeholder {name}"));
+            return ControlFlow::Break(());
+        }
+        self.order.push(index);
+        self.token.clone_into(name);
+        ControlFlow::Continue(())
     }
 }
 

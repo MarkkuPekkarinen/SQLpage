@@ -460,6 +460,38 @@ mod tests {
         };
         assert_eq!(query.bindings.len(), 2);
         assert_eq!(query.sql.matches('?').count(), 2);
+        assert_eq!(
+            query.bindings.as_ref(),
+            [
+                variable("a"),
+                call(SqlPageFunctionName::url_encode, [variable("b")])
+            ]
+        );
+    }
+
+    #[test]
+    fn positional_bindings_follow_cte_rendering_order() {
+        let database = database(SupportedDatabase::MySql);
+        let statement = parse_sql(
+            &database,
+            &MySqlDialect {},
+            "with c as (select $a as x) select $b as y from c",
+        )
+        .unwrap()
+        .next()
+        .unwrap();
+        let FileStatement::Query(Query {
+            body: QueryBody::Database(query),
+            ..
+        }) = statement
+        else {
+            panic!("expected database query");
+        };
+        assert_eq!(
+            query.sql,
+            "WITH c AS (SELECT CAST(? AS CHAR) AS x) SELECT CAST(? AS CHAR) AS y FROM c"
+        );
+        assert_eq!(query.bindings.as_ref(), [variable("a"), variable("b")]);
     }
 
     #[test]
