@@ -617,18 +617,13 @@ fn parse_single_sql_result(
             if log::log_enabled!(log::Level::Trace) {
                 debug_row(&r);
             }
-            match super::sql_to_json::row_to_json_with_inputs(&r, &query.row_inputs) {
+            match super::sql_to_json::row_to_json_with_inputs(&r, query.row_input_json.len()) {
                 Ok((row, mut inputs)) => {
-                    let decode_as_json = query
-                        .row_inputs
-                        .iter()
-                        .map(|input| input.decode_as_json)
-                        .collect::<Vec<_>>();
-                    decode_json_values(&mut inputs, &decode_as_json);
+                    decode_json_values(&mut inputs, &query.row_input_json);
                     QueryResult {
                         item: DbItem::Row(row),
                         inputs: RowInputs::new(inputs),
-                        output_column_count: r.columns().len() - query.row_inputs.len()
+                        output_column_count: r.columns().len() - query.row_input_json.len()
                             + query.computed_columns.len(),
                     }
                 }

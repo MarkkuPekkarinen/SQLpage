@@ -9,8 +9,6 @@ use sqlx::postgres::types::PgRange;
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 use sqlx::{Decode, Type};
 
-use super::sql::RowInputColumn;
-
 #[cfg(test)]
 pub fn row_to_json(row: &AnyRow) -> Value {
     use Value::Object;
@@ -25,36 +23,28 @@ pub fn row_to_json(row: &AnyRow) -> Value {
     Object(map)
 }
 
-/// Decodes a row into user-visible columns and generated private inputs.
+/// Decodes a row into user-visible columns and a private trailing input suffix.
 ///
-/// Every SQL value is decoded exactly once. Private values are identified by
-/// their recorded ordinal and returned in input-id order.
+/// Every SQL value is decoded exactly once. Private values are addressed by
+/// ordinal, so their generated SQL aliases cannot collide with user columns.
 pub fn row_to_json_with_inputs(
     row: &AnyRow,
-    input_columns: &[RowInputColumn],
+    input_count: usize,
 ) -> anyhow::Result<(Value, Vec<Value>)> {
     let columns = row.columns();
+    let public_count = columns
+        .len()
+        .checked_sub(input_count)
+        .ok_or_else(|| anyhow::anyhow!("The query returned fewer columns than SQLPage expected"))?;
     let mut map = Map::new();
-    let mut inputs = Vec::with_capacity(input_columns.len());
-    let mut next_input = input_columns.iter().peekable();
-    for column in columns {
+    let mut inputs = Vec::with_capacity(input_count);
+    for column in &columns[..public_count] {
         let key = canonical_col_name(column);
         let value = sql_to_json(row, column);
-        if next_input
-            .peek()
-            .is_some_and(|input| input.ordinal == column.ordinal())
-        {
-            inputs.push(value);
-            next_input.next();
-        } else {
-            map = add_value_to_map(map, (key, value));
-        }
+        map = add_value_to_map(map, (key, value));
     }
-    if let Some(input) = next_input.next() {
-        anyhow::bail!(
-            "The query did not return SQLPage input at ordinal {}",
-            input.ordinal
-        );
+    for column in &columns[public_count..] {
+        inputs.push(sql_to_json(row, column));
     }
     Ok((Value::Object(map), inputs))
 }
@@ -244,21 +234,15 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn private_inputs_are_split_by_recorded_ordinal() -> anyhow::Result<()> {
+    async fn private_inputs_are_split_from_the_trailing_suffix() -> anyhow::Result<()> {
         let db_url = test_database_url();
         let mut connection = sqlx::AnyConnection::connect(&db_url).await?;
-        let row = sqlx::query("SELECT 1 AS __sqlpage_input_0, 2 AS public")
+        let row = sqlx::query("SELECT 1 AS __sqlpage_input_0, 2 AS __sqlpage_input_0")
             .fetch_one(&mut connection)
             .await?;
-        let (public, inputs) = row_to_json_with_inputs(
-            &row,
-            &[RowInputColumn {
-                ordinal: 0,
-                decode_as_json: false,
-            }],
-        )?;
-        expect_json_object_equal(&public, &serde_json::json!({ "public": 2 }));
-        assert_eq!(inputs, [serde_json::json!(1)]);
+        let (public, inputs) = row_to_json_with_inputs(&row, 1)?;
+        expect_json_object_equal(&public, &serde_json::json!({ "__sqlpage_input_0": 1 }));
+        assert_eq!(inputs, [serde_json::json!(2)]);
         Ok(())
     }
 

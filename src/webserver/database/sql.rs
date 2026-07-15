@@ -26,8 +26,8 @@ mod statement;
 pub(super) use statement::SourceLocation;
 pub use statement::SqlFile;
 pub(super) use statement::{
-    DatabaseQuery, FileStatement, OutputColumn, Query, QueryBody, RowInputColumn, SingleRowQuery,
-    SourceSpan, VariableName,
+    DatabaseQuery, FileStatement, OutputColumn, Query, QueryBody, SingleRowQuery, SourceSpan,
+    VariableName,
 };
 
 impl SqlFile {
@@ -427,7 +427,7 @@ mod tests {
             panic!("expected database query");
         };
         assert!(query.bindings.is_empty());
-        assert_eq!(query.row_inputs.len(), 1);
+        assert_eq!(query.row_input_json.len(), 1);
         assert_eq!(query.computed_columns.len(), 1);
         assert!(!query.sql.contains("sqlpage."));
     }
@@ -483,8 +483,8 @@ mod tests {
             query.bindings.as_ref(),
             [
                 variable("a"),
-                call(SqlPageFunctionName::url_encode, [variable("b")]),
                 variable("c"),
+                call(SqlPageFunctionName::url_encode, [variable("b")]),
             ]
         );
     }
@@ -588,16 +588,7 @@ mod tests {
             DatabaseQuery {
                 sql: "SELECT value AS \"__sqlpage_input_0\", upper(CAST($1 AS TEXT)) AS \"__sqlpage_input_1\" FROM t".into(),
                 bindings: Box::new([call(SqlPageFunctionName::url_encode, [variable("prefix")])]),
-                row_inputs: Box::new([
-                    RowInputColumn {
-                        ordinal: 0,
-                        decode_as_json: false,
-                    },
-                    RowInputColumn {
-                        ordinal: 1,
-                        decode_as_json: false,
-                    },
-                ]),
+                row_input_json: Box::new([false, false]),
                 computed_columns: Box::new([OutputColumn {
                     name: "result".into(),
                     value: coalesce([
@@ -623,10 +614,7 @@ mod tests {
                     SqlPageFunctionName::url_encode,
                     [variable("expected")]
                 )]),
-                row_inputs: Box::new([RowInputColumn {
-                    ordinal: 0,
-                    decode_as_json: false,
-                }]),
+                row_input_json: Box::new([false]),
                 computed_columns: Box::new([OutputColumn {
                     name: "encoded".into(),
                     value: call(SqlPageFunctionName::url_encode, [row(0)]),
@@ -645,10 +633,7 @@ mod tests {
             DatabaseQuery {
                 sql: "SELECT value AS \"__sqlpage_input_0\" FROM t".into(),
                 bindings: Box::new([]),
-                row_inputs: Box::new([RowInputColumn {
-                    ordinal: 0,
-                    decode_as_json: false,
-                }]),
+                row_input_json: Box::new([false]),
                 computed_columns: Box::new([OutputColumn {
                     name: "encoded".into(),
                     value: coalesce([

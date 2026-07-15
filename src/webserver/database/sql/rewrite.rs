@@ -8,15 +8,14 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, CastKind, CharacterLength, DataType, Expr as SqlExpr, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart,
-    OrderByKind, SelectItem, SetExpr, Spanned as _, Statement as SqlStatement, Value,
-    ValueWithSpan, VisitMut, VisitorMut,
+    OrderByKind, SelectItem, SetExpr, Statement as SqlStatement, Value, ValueWithSpan, VisitMut,
+    VisitorMut,
 };
 use sqlparser::tokenizer::Span;
 
 use super::dialect::{PlaceholderStyle, placeholder_style};
 use super::statement::{
-    DatabaseQuery, OutputColumn, Query, QueryBody, RowInputColumn, SingleRowQuery, SourceLocation,
-    SourceSpan,
+    DatabaseQuery, OutputColumn, Query, QueryBody, SingleRowQuery, SourceLocation, SourceSpan,
 };
 use super::{extract_json_columns, is_json_expression, is_sqlpage_func};
 use crate::webserver::database::sqlpage_expr::{
@@ -33,7 +32,6 @@ const SQLPAGE_INPUT_PREFIX: &str = "__sqlpage_input_";
 /// be ordered as they appear in the rendered SQL.
 struct PendingBinding {
     value: StandaloneExpr,
-    span: Span,
     sequence: usize,
 }
 
@@ -41,7 +39,10 @@ struct PendingBinding {
 struct QueryRewriter<'a> {
     database: &'a DbInfo,
     bindings: Vec<PendingBinding>,
-    row_inputs: Vec<RowInputColumn>,
+    private_bindings: Vec<PendingBinding>,
+    next_binding_sequence: usize,
+    collecting_private_bindings: bool,
+    row_input_json: Vec<bool>,
     private_projection: Vec<SelectItem>,
     error: Option<anyhow::Error>,
 }
@@ -125,7 +126,10 @@ pub(super) fn rewrite_query(
     let mut rewriter = QueryRewriter {
         database,
         bindings: Vec::new(),
-        row_inputs: Vec::new(),
+        private_bindings: Vec::new(),
+        next_binding_sequence: 0,
+        collecting_private_bindings: false,
+        row_input_json: Vec::new(),
         private_projection: Vec::new(),
         error: None,
     };
@@ -136,6 +140,7 @@ pub(super) fn rewrite_query(
         });
     }
     let computed_columns = rewrite_top_level_projection(&mut statement, &mut rewriter)?;
+    rewriter.finish_projection_bindings();
 
     let _ = statement.visit(&mut rewriter);
     if let Some(error) = rewriter.error {
@@ -150,10 +155,7 @@ pub(super) fn rewrite_query(
             expr: SqlExpr::value(Value::Null),
             alias: Ident::with_quote('"', format!("{SQLPAGE_INPUT_PREFIX}anchor")),
         });
-        rewriter.row_inputs.push(RowInputColumn {
-            ordinal: 0,
-            decode_as_json: false,
-        });
+        rewriter.row_input_json.push(false);
     }
 
     let json_columns = extract_json_columns(&statement, database.database_type)
@@ -170,7 +172,7 @@ pub(super) fn rewrite_query(
         body: QueryBody::Database(DatabaseQuery {
             sql,
             bindings,
-            row_inputs: rewriter.row_inputs.into_boxed_slice(),
+            row_input_json: rewriter.row_input_json.into_boxed_slice(),
             computed_columns: computed_columns.into_boxed_slice(),
             json_columns,
         }),
@@ -179,7 +181,7 @@ pub(super) fn rewrite_query(
 }
 
 /// Removes SQLPage-owned projection expressions from the database projection
-/// and inserts their private database inputs at the same projection position.
+/// and appends their private database inputs as a trailing suffix.
 fn rewrite_top_level_projection(
     statement: &mut SqlStatement,
     rewriter: &mut QueryRewriter<'_>,
@@ -199,7 +201,6 @@ fn rewrite_top_level_projection(
 
     let mut database_projection = Vec::with_capacity(select.projection.len());
     for item in std::mem::take(&mut select.projection) {
-        let first_input = rewriter.row_inputs.len();
         match item {
             SelectItem::ExprWithAlias { expr, alias } => {
                 match rewriter.rewrite_projection(expr)? {
@@ -227,12 +228,8 @@ fn rewrite_top_level_projection(
             }
             item => database_projection.push(item),
         }
-        database_projection.append(&mut rewriter.private_projection);
-        let first_ordinal = database_projection.len() - (rewriter.row_inputs.len() - first_input);
-        for (offset, input) in rewriter.row_inputs[first_input..].iter_mut().enumerate() {
-            input.ordinal = first_ordinal + offset;
-        }
     }
+    database_projection.append(&mut rewriter.private_projection);
     select.projection = database_projection;
     let computed_names = computed_columns
         .iter()
@@ -488,13 +485,15 @@ impl QueryRewriter<'_> {
         self.error.take().map_or(Ok(()), Err)
     }
 
-    fn add_binding(&mut self, value: StandaloneExpr, span: Span) -> SqlExpr {
-        let sequence = self.bindings.len();
-        self.bindings.push(PendingBinding {
-            value,
-            span,
-            sequence,
-        });
+    fn add_binding(&mut self, value: StandaloneExpr) -> SqlExpr {
+        let sequence = self.next_binding_sequence;
+        self.next_binding_sequence += 1;
+        let binding = PendingBinding { value, sequence };
+        if self.collecting_private_bindings {
+            self.private_bindings.push(binding);
+        } else {
+            self.bindings.push(binding);
+        }
         let placeholder = match placeholder_style(self.database.kind) {
             PlaceholderStyle::Numbered { prefix } => format!("{prefix}{}", sequence + 1),
             PlaceholderStyle::Positional { token } => token.to_owned(),
@@ -504,34 +503,33 @@ impl QueryRewriter<'_> {
 
     fn add_row_input(&mut self, mut expression: SqlExpr) -> anyhow::Result<RowInputId> {
         let decode_as_json = is_json_expression(&expression);
-        self.rewrite_database_expression(&mut expression)?;
-        let index = self.row_inputs.len();
+        let was_collecting_private_bindings = self.collecting_private_bindings;
+        self.collecting_private_bindings = true;
+        let rewrite_result = self.rewrite_database_expression(&mut expression);
+        self.collecting_private_bindings = was_collecting_private_bindings;
+        rewrite_result?;
+        let index = self.row_input_json.len();
         let name = format!("{SQLPAGE_INPUT_PREFIX}{index}");
         self.private_projection.push(SelectItem::ExprWithAlias {
             expr: expression,
             alias: Ident::with_quote('"', name),
         });
-        self.row_inputs.push(RowInputColumn {
-            ordinal: 0,
-            decode_as_json,
-        });
+        self.row_input_json.push(decode_as_json);
         Ok(RowInputId::new(index))
     }
 
-    /// Finalizes bindings in database placeholder order. Positional backends
-    /// require lexical ordering because every placeholder is spelled `?`.
+    fn finish_projection_bindings(&mut self) {
+        self.bindings.append(&mut self.private_bindings);
+    }
+
+    /// Finalizes bindings in database placeholder order. Numbered backends use
+    /// creation order even when private projections move to the trailing suffix.
     fn finish_bindings(&mut self) -> Box<[StandaloneExpr]> {
         if matches!(
             placeholder_style(self.database.kind),
-            PlaceholderStyle::Positional { .. }
+            PlaceholderStyle::Numbered { .. }
         ) {
-            self.bindings.sort_by_key(|binding| {
-                (
-                    binding.span.start.line,
-                    binding.span.start.column,
-                    binding.sequence,
-                )
-            });
+            self.bindings.sort_by_key(|binding| binding.sequence);
         }
         std::mem::take(&mut self.bindings)
             .into_iter()
@@ -557,19 +555,13 @@ impl VisitorMut for QueryRewriter<'_> {
                 value: Value::Placeholder(_),
                 ..
             })
-            | SqlExpr::Identifier(_) => match variable_from_expr(expression) {
-                Some(variable) => {
-                    let span = expression.span();
-                    Some(self.add_binding(SqlPageExpr::Variable(variable), span))
-                }
-                None => None,
-            },
+            | SqlExpr::Identifier(_) => variable_from_expr(expression)
+                .map(|variable| self.add_binding(SqlPageExpr::Variable(variable))),
             SqlExpr::Function(function) => match recognize_sqlpage_function(function) {
                 Ok(Some(_)) => {
-                    let span = expression.span();
                     let owned = std::mem::replace(expression, SqlExpr::value(Value::Null));
                     match build_sqlpage_expr::<StandaloneEnvironment>(self, owned) {
-                        Ok(value) => Some(self.add_binding(value, span)),
+                        Ok(value) => Some(self.add_binding(value)),
                         Err(error) => {
                             self.error = Some(error.context(
                                 "A SQLPage function used by the database could not be evaluated before the query",
