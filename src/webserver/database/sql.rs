@@ -563,6 +563,26 @@ mod tests {
     }
 
     #[test]
+    fn database_cannot_filter_by_computed_column_in_having() {
+        let FileStatement::Error(error) = one(
+            "select sqlpage.url_encode(name) as enc, count(*) from users group by name having enc <> ''",
+        ) else {
+            panic!("expected rewrite error");
+        };
+        assert!(error.to_string().contains("HAVING"));
+    }
+
+    #[test]
+    fn database_cannot_group_by_computed_column_in_expression() {
+        let FileStatement::Error(error) =
+            one("select sqlpage.url_encode(name) as enc, count(*) from users group by lower(enc)")
+        else {
+            panic!("expected rewrite error");
+        };
+        assert!(error.to_string().contains("GROUP BY"));
+    }
+
+    #[test]
     fn placeholder_like_literal_is_not_rewritten() {
         let database = database(SupportedDatabase::MySql);
         let statement = parse_sql(

@@ -35,6 +35,28 @@ struct QueryRewriter<'a> {
     error: Option<anyhow::Error>,
 }
 
+struct ComputedAliasFinder<'a> {
+    computed_columns: &'a [OutputColumn<RowExpr>],
+}
+
+impl sqlparser::ast::Visitor for ComputedAliasFinder<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expression: &SqlExpr) -> ControlFlow<Self::Break> {
+        let SqlExpr::Identifier(identifier) = expression else {
+            return ControlFlow::Continue(());
+        };
+        if self
+            .computed_columns
+            .iter()
+            .any(|column| identifier.value.eq_ignore_ascii_case(&column.name))
+        {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// Result of partitioning one projected expression.
 // Keeping the owned AST inline avoids one heap allocation for every ordinary
 // projected expression. The enum is short-lived inside the rewriter.
@@ -188,6 +210,15 @@ fn rewrite_top_level_projection(
     select.projection = database_projection;
 
     reject_computed_group_by_references(&select.group_by, &computed_columns)?;
+    reject_computed_alias_references("HAVING", select.having.as_ref(), &computed_columns)?;
+    reject_computed_alias_references("QUALIFY", select.qualify.as_ref(), &computed_columns)?;
+    reject_computed_aliases_in_expressions("CLUSTER BY", &select.cluster_by, &computed_columns)?;
+    reject_computed_aliases_in_expressions(
+        "DISTRIBUTE BY",
+        &select.distribute_by,
+        &computed_columns,
+    )?;
+    reject_computed_ordering_references("SORT BY", &select.sort_by, &computed_columns)?;
     reject_computed_order_by_references(query.order_by.as_ref(), &computed_columns)?;
     Ok(computed_columns)
 }
@@ -234,12 +265,23 @@ fn reject_computed_order_by_references(
 ) -> anyhow::Result<()> {
     if let Some(order_by) = order_by
         && let OrderByKind::Expressions(expressions) = &order_by.kind
-        && expressions
-            .iter()
-            .any(|ordering| references_computed_column(&ordering.expr, computed_columns))
+    {
+        reject_computed_ordering_references("ORDER BY", expressions, computed_columns)?;
+    }
+    Ok(())
+}
+
+fn reject_computed_ordering_references(
+    clause: &str,
+    expressions: &[sqlparser::ast::OrderByExpr],
+    computed_columns: &[OutputColumn<RowExpr>],
+) -> anyhow::Result<()> {
+    if expressions
+        .iter()
+        .any(|ordering| references_computed_projection(&ordering.expr, computed_columns, true))
     {
         anyhow::bail!(
-            "ORDER BY cannot reference a SQLPage-computed column because ordering is performed by the database"
+            "{clause} cannot reference a SQLPage-computed column because ordering is performed by the database"
         );
     }
     Ok(())
@@ -254,7 +296,7 @@ fn reject_computed_group_by_references(
     };
     if expressions
         .iter()
-        .any(|expression| references_computed_column(expression, computed_columns))
+        .any(|expression| references_computed_projection(expression, computed_columns, true))
     {
         anyhow::bail!(
             "GROUP BY cannot reference a SQLPage-computed column because grouping is performed by the database"
@@ -263,26 +305,59 @@ fn reject_computed_group_by_references(
     Ok(())
 }
 
-fn references_computed_column(
+fn reject_computed_alias_references(
+    clause: &str,
+    expression: Option<&SqlExpr>,
+    computed_columns: &[OutputColumn<RowExpr>],
+) -> anyhow::Result<()> {
+    if expression.is_some_and(|expression| {
+        references_computed_projection(expression, computed_columns, false)
+    }) {
+        anyhow::bail!(
+            "{clause} cannot reference a SQLPage-computed column because it is evaluated by the database"
+        );
+    }
+    Ok(())
+}
+
+fn reject_computed_aliases_in_expressions(
+    clause: &str,
+    expressions: &[SqlExpr],
+    computed_columns: &[OutputColumn<RowExpr>],
+) -> anyhow::Result<()> {
+    if expressions
+        .iter()
+        .any(|expression| references_computed_projection(expression, computed_columns, false))
+    {
+        anyhow::bail!(
+            "{clause} cannot reference a SQLPage-computed column because it is evaluated by the database"
+        );
+    }
+    Ok(())
+}
+
+fn references_computed_projection(
     expression: &SqlExpr,
     computed_columns: &[OutputColumn<RowExpr>],
+    reject_ordinal: bool,
 ) -> bool {
     if computed_columns.is_empty() {
         return false;
     }
-    matches!(
-        expression,
-        SqlExpr::Value(ValueWithSpan {
-            value: Value::Number(_, _),
-            ..
-        })
-    ) || computed_columns.iter().any(|column| {
-        matches!(
+    if reject_ordinal
+        && matches!(
             expression,
-            SqlExpr::Identifier(identifier)
-                if identifier.value.eq_ignore_ascii_case(&column.name)
+            SqlExpr::Value(ValueWithSpan {
+                value: Value::Number(_, _),
+                ..
+            })
         )
-    })
+    {
+        return true;
+    }
+
+    let mut finder = ComputedAliasFinder { computed_columns };
+    sqlparser::ast::Visit::visit(expression, &mut finder).is_break()
 }
 
 /// Rewrites a guaranteed one-row query directly as standalone expressions,
