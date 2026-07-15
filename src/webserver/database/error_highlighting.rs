@@ -84,7 +84,7 @@ struct NicePositionedError {
 
 impl std::fmt::Display for NicePositionedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "In \"{}\": {}", self.source_file.display(), self.error)?;
+        write!(f, "In \"{}\": {:#}", self.source_file.display(), self.error)?;
         write_source_position_info(f, &self.source_file, Some(self.query_position))
     }
 }
@@ -183,6 +183,23 @@ fn test_display_stmt_error_includes_file_and_line() {
     let message = err.to_string();
     assert!(message.contains("In \"example.sql\": boom"));
     assert!(message.contains("example.sql: line 12"));
+}
+
+#[test]
+fn test_display_stmt_error_includes_error_chain() {
+    let err = display_stmt_error(
+        Path::new("example.sql"),
+        SourceSpan {
+            start: super::sql::SourceLocation { line: 4, column: 1 },
+            end: super::sql::SourceLocation {
+                line: 4,
+                column: 20,
+            },
+        },
+        anyhow::anyhow!("native database error").context("Failed to set variable x"),
+    );
+    let message = err.to_string();
+    assert!(message.contains("Failed to set variable x: native database error"));
 }
 
 #[test]

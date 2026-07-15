@@ -280,9 +280,8 @@ pub fn stream_query_results_with_conn<'a>(
                 },
                 FileStatement::SetVariable { target, value} => {
                     execute_set_variable_query(db_connection, request, target, value, source_file).await
-                    .with_context(||
-                        format!("Failed to set the {} variable to {value:?}", target.0)
-                    )?;
+                    .with_context(|| format!("Failed to set variable {}", target.0))
+                    .map_err(|error| with_stmt_position(source_file, value.source_span, error))?;
                 },
                 FileStatement::Error(e) => yield DbItem::Error(clone_anyhow_err(source_file, e)),
             }
