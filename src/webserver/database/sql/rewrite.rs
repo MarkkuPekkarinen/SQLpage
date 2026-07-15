@@ -19,8 +19,7 @@ use super::statement::{
 };
 use super::{extract_json_columns, is_json_expression, is_sqlpage_func};
 use crate::webserver::database::sqlpage_expr::{
-    ConcatNullBehavior, NoRowInput, RowExpr, RowInputId, SqlPageExpr, StandaloneExpr, VariableRef,
-    VariableSource,
+    NoRowInput, RowExpr, RowInputId, SqlPageExpr, StandaloneExpr, VariableRef, VariableSource,
 };
 use crate::webserver::database::sqlpage_functions::functions::SqlPageFunctionName;
 use crate::webserver::database::{DbInfo, SupportedDatabase};
@@ -418,7 +417,7 @@ impl QueryRewriter<'_> {
                             self.projection_into_row_expr(right)?,
                         ]
                         .into_boxed_slice(),
-                        null_behavior: ConcatNullBehavior::PropagateNull,
+                        null_behavior: self.database.database_type.concat_operator_null_behavior(),
                     })),
                 }
             }
@@ -668,7 +667,10 @@ fn build_sqlpage_expr<Environment: ExprEnvironment>(
                 build_sqlpage_expr::<Environment>(rewriter, *right)?,
             ]
             .into_boxed_slice(),
-            null_behavior: ConcatNullBehavior::PropagateNull,
+            null_behavior: rewriter
+                .database
+                .database_type
+                .concat_operator_null_behavior(),
         }),
         expression => Environment::use_database_expr(rewriter, expression),
     }

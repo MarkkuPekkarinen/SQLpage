@@ -346,14 +346,15 @@ mod tests {
     }
 
     fn one(sql: &str) -> FileStatement {
-        parse_sql(
-            &database(SupportedDatabase::Postgres),
-            &PostgreSqlDialect {},
-            sql,
-        )
-        .unwrap()
-        .next()
-        .unwrap()
+        one_for(SupportedDatabase::Postgres, sql)
+    }
+
+    fn one_for(database_type: SupportedDatabase, sql: &str) -> FileStatement {
+        let database = database(database_type);
+        parse_sql(&database, &PostgreSqlDialect {}, sql)
+            .unwrap()
+            .next()
+            .unwrap()
     }
 
     fn rewrite_database(sql: &str) -> DatabaseQuery {
@@ -565,6 +566,47 @@ mod tests {
             panic!("expected a single SQLPage-owned row");
         };
         assert_eq!(query.columns.len(), 1);
+    }
+
+    #[test]
+    fn concat_operator_uses_backend_null_behavior_in_sqlpage_expressions() {
+        for database_type in [SupportedDatabase::Oracle, SupportedDatabase::Mssql] {
+            let FileStatement::Query(Query {
+                body: QueryBody::SingleRow(query),
+                ..
+            }) = one_for(database_type, "select '/' || null as path")
+            else {
+                panic!("expected a single SQLPage-owned row");
+            };
+            assert!(matches!(
+                &query.columns[0].value,
+                SqlPageExpr::Concat {
+                    null_behavior: ConcatNullBehavior::IgnoreNull,
+                    ..
+                }
+            ));
+
+            let FileStatement::Query(Query {
+                body: QueryBody::Database(query),
+                ..
+            }) = one_for(
+                database_type,
+                "select sqlpage.url_encode('/' || nullable_col) as path from input_rows",
+            )
+            else {
+                panic!("expected a database query");
+            };
+            let SqlPageExpr::Call { arguments, .. } = &query.computed_columns[0].value else {
+                panic!("expected a SQLPage function call");
+            };
+            assert!(matches!(
+                &arguments[0],
+                SqlPageExpr::Concat {
+                    null_behavior: ConcatNullBehavior::IgnoreNull,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

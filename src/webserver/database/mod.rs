@@ -101,6 +101,15 @@ impl SupportedDatabase {
             Self::MySql | Self::Snowflake | Self::Generic => PropagateNull,
         }
     }
+
+    fn concat_operator_null_behavior(self) -> sqlpage_expr::ConcatNullBehavior {
+        use sqlpage_expr::ConcatNullBehavior::{IgnoreNull, PropagateNull};
+
+        match self {
+            Self::Oracle | Self::Mssql => IgnoreNull,
+            _ => PropagateNull,
+        }
+    }
 }
 
 impl From<AnyKind> for SupportedDatabase {
@@ -205,6 +214,23 @@ mod tests {
             SupportedDatabase::Generic,
         ] {
             assert_eq!(database.concat_function_null_behavior(), PropagateNull);
+        }
+    }
+
+    #[test]
+    fn concat_operator_null_behavior_matches_backends() {
+        for database in [SupportedDatabase::Oracle, SupportedDatabase::Mssql] {
+            assert_eq!(database.concat_operator_null_behavior(), IgnoreNull);
+        }
+        for database in [
+            SupportedDatabase::Sqlite,
+            SupportedDatabase::Duckdb,
+            SupportedDatabase::Postgres,
+            SupportedDatabase::MySql,
+            SupportedDatabase::Snowflake,
+            SupportedDatabase::Generic,
+        ] {
+            assert_eq!(database.concat_operator_null_behavior(), PropagateNull);
         }
     }
 }
