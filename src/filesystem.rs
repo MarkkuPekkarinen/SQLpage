@@ -445,9 +445,17 @@ async fn test_sql_file_read_utf8() -> anyhow::Result<()> {
     let create_table_sql = DbFsQueries::get_create_table_sql(state.db.info.database_type);
     let db = &state.db;
     let conn = &db.connection;
-    conn.execute("DROP TABLE IF EXISTS sqlpage_files").await?;
-    log::debug!("Creating table sqlpage_files: {create_table_sql}");
-    conn.execute(create_table_sql).await?;
+    // Other tests share this database, so never drop a table their initialized state may use.
+    if conn
+        .execute("SELECT 1 FROM sqlpage_files WHERE 1 = 0")
+        .await
+        .is_err()
+    {
+        log::debug!("Creating table sqlpage_files: {create_table_sql}");
+        conn.execute(create_table_sql).await?;
+    }
+    conn.execute("DELETE FROM sqlpage_files WHERE path = 'unit test file.txt'")
+        .await?;
 
     let dbms = db.info.kind;
     let insert_sql = format!(
