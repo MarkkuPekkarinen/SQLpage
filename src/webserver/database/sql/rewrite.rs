@@ -240,7 +240,14 @@ fn rewrite_top_level_projection(
     if let Some(order_by) = &query.order_by
         && let OrderByKind::Expressions(expressions) = &order_by.kind
         && expressions.iter().any(|ordering| {
-            computed_names.iter().any(|name| {
+            (!computed_names.is_empty()
+                && matches!(
+                    &ordering.expr,
+                    SqlExpr::Value(ValueWithSpan {
+                        value: Value::Number(_, _),
+                        ..
+                    })
+                )) || computed_names.iter().any(|name| {
                 matches!(
                     &ordering.expr,
                     SqlExpr::Identifier(identifier) if identifier.value.eq_ignore_ascii_case(name)
