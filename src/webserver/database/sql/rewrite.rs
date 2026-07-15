@@ -7,9 +7,9 @@ use anyhow::{Context as _, anyhow};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, CastKind, CharacterLength, DataType, Expr as SqlExpr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart,
-    OrderByKind, SelectItem, SetExpr, Statement as SqlStatement, Value, ValueWithSpan, VisitMut,
-    VisitorMut,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, ObjectName,
+    ObjectNamePart, OrderByKind, SelectItem, SetExpr, Statement as SqlStatement, Value,
+    ValueWithSpan, VisitMut, VisitorMut,
 };
 use sqlparser::tokenizer::Span;
 
@@ -185,12 +185,11 @@ fn rewrite_top_level_projection(
     statement: &mut SqlStatement,
     rewriter: &mut QueryRewriter<'_>,
 ) -> anyhow::Result<Vec<OutputColumn<RowExpr>>> {
-    let mut computed_columns = Vec::new();
     let SqlStatement::Query(query) = statement else {
-        return Ok(computed_columns);
+        return Ok(Vec::new());
     };
     let SetExpr::Select(select) = query.body.as_mut() else {
-        return Ok(computed_columns);
+        return Ok(Vec::new());
     };
     if select.distinct.is_some() && select.projection.iter().any(select_item_contains_sqlpage) {
         anyhow::bail!(
@@ -198,65 +197,107 @@ fn rewrite_top_level_projection(
         );
     }
 
-    let mut database_projection = Vec::with_capacity(select.projection.len());
-    for item in std::mem::take(&mut select.projection) {
-        match item {
-            SelectItem::ExprWithAlias { expr, alias } => {
-                match rewriter.rewrite_projection(expr)? {
-                    RewrittenProjection::Database(expr) => {
-                        database_projection.push(SelectItem::ExprWithAlias { expr, alias });
-                    }
-                    RewrittenProjection::PerRow(value) => {
-                        computed_columns.push(OutputColumn {
-                            name: alias.value,
-                            value,
-                        });
-                    }
-                }
-            }
-            SelectItem::UnnamedExpr(expr) => {
-                let name = expr.to_string();
-                match rewriter.rewrite_projection(expr)? {
-                    RewrittenProjection::Database(expr) => {
-                        database_projection.push(SelectItem::UnnamedExpr(expr));
-                    }
-                    RewrittenProjection::PerRow(value) => {
-                        computed_columns.push(OutputColumn { name, value });
-                    }
-                }
-            }
-            item => database_projection.push(item),
-        }
-    }
+    let (mut database_projection, computed_columns) =
+        rewrite_projection_items(std::mem::take(&mut select.projection), rewriter)?;
     database_projection.append(&mut rewriter.private_projection);
     select.projection = database_projection;
-    let computed_names = computed_columns
-        .iter()
-        .map(|column| column.name.as_str())
-        .collect::<Vec<_>>();
-    if let Some(order_by) = &query.order_by
+
+    reject_computed_group_by_references(&select.group_by, &computed_columns)?;
+    reject_computed_order_by_references(query.order_by.as_ref(), &computed_columns)?;
+    Ok(computed_columns)
+}
+
+fn rewrite_projection_items(
+    projection: Vec<SelectItem>,
+    rewriter: &mut QueryRewriter<'_>,
+) -> anyhow::Result<(Vec<SelectItem>, Vec<OutputColumn<RowExpr>>)> {
+    let mut database_projection = Vec::with_capacity(projection.len());
+    let mut computed_columns = Vec::new();
+    for item in projection {
+        let (expression, alias) = match item {
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            item => {
+                database_projection.push(item);
+                continue;
+            }
+        };
+        let name = alias
+            .as_ref()
+            .map_or_else(|| expression.to_string(), |alias| alias.value.clone());
+        match rewriter.rewrite_projection(expression)? {
+            RewrittenProjection::Database(expression) => {
+                database_projection.push(match alias {
+                    Some(alias) => SelectItem::ExprWithAlias {
+                        expr: expression,
+                        alias,
+                    },
+                    None => SelectItem::UnnamedExpr(expression),
+                });
+            }
+            RewrittenProjection::PerRow(value) => {
+                computed_columns.push(OutputColumn { name, value });
+            }
+        }
+    }
+    Ok((database_projection, computed_columns))
+}
+
+fn reject_computed_order_by_references(
+    order_by: Option<&sqlparser::ast::OrderBy>,
+    computed_columns: &[OutputColumn<RowExpr>],
+) -> anyhow::Result<()> {
+    if let Some(order_by) = order_by
         && let OrderByKind::Expressions(expressions) = &order_by.kind
-        && expressions.iter().any(|ordering| {
-            (!computed_names.is_empty()
-                && matches!(
-                    &ordering.expr,
-                    SqlExpr::Value(ValueWithSpan {
-                        value: Value::Number(_, _),
-                        ..
-                    })
-                )) || computed_names.iter().any(|name| {
-                matches!(
-                    &ordering.expr,
-                    SqlExpr::Identifier(identifier) if identifier.value.eq_ignore_ascii_case(name)
-                )
-            })
-        })
+        && expressions
+            .iter()
+            .any(|ordering| references_computed_column(&ordering.expr, computed_columns))
     {
         anyhow::bail!(
             "ORDER BY cannot reference a SQLPage-computed column because ordering is performed by the database"
         );
     }
-    Ok(computed_columns)
+    Ok(())
+}
+
+fn reject_computed_group_by_references(
+    group_by: &GroupByExpr,
+    computed_columns: &[OutputColumn<RowExpr>],
+) -> anyhow::Result<()> {
+    let GroupByExpr::Expressions(expressions, _) = group_by else {
+        return Ok(());
+    };
+    if expressions
+        .iter()
+        .any(|expression| references_computed_column(expression, computed_columns))
+    {
+        anyhow::bail!(
+            "GROUP BY cannot reference a SQLPage-computed column because grouping is performed by the database"
+        );
+    }
+    Ok(())
+}
+
+fn references_computed_column(
+    expression: &SqlExpr,
+    computed_columns: &[OutputColumn<RowExpr>],
+) -> bool {
+    if computed_columns.is_empty() {
+        return false;
+    }
+    matches!(
+        expression,
+        SqlExpr::Value(ValueWithSpan {
+            value: Value::Number(_, _),
+            ..
+        })
+    ) || computed_columns.iter().any(|column| {
+        matches!(
+            expression,
+            SqlExpr::Identifier(identifier)
+                if identifier.value.eq_ignore_ascii_case(&column.name)
+        )
+    })
 }
 
 /// Rewrites a guaranteed one-row query directly as standalone expressions,

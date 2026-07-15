@@ -511,6 +511,26 @@ mod tests {
     }
 
     #[test]
+    fn database_cannot_group_by_computed_column() {
+        let FileStatement::Error(error) = one(
+            "select coalesce(sqlpage.url_encode(name), '') as enc, count(*) from users group by enc",
+        ) else {
+            panic!("expected rewrite error");
+        };
+        assert!(error.to_string().contains("GROUP BY"));
+    }
+
+    #[test]
+    fn database_cannot_group_by_ordinal_with_computed_columns() {
+        let FileStatement::Error(error) =
+            one("select a, sqlpage.url_encode(b) as encoded from t group by 1")
+        else {
+            panic!("expected rewrite error");
+        };
+        assert!(error.to_string().contains("GROUP BY"));
+    }
+
+    #[test]
     fn placeholder_like_literal_is_not_rewritten() {
         let database = database(SupportedDatabase::MySql);
         let statement = parse_sql(
