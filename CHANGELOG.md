@@ -2,7 +2,7 @@
 
 ## unreleased
 
-- **SQLPage function evaluation is now lazier.** A `sqlpage.*` call that is the whole value of a selected column now runs after the database query, once for each returned row. If the query returns no rows, the function is not called. Other SQLPage function calls still run before the query when their arguments do not depend on database columns. `SET x = (SELECT ...)` now has explicit scalar-query semantics: zero rows set `x` to `NULL`, one row with one column sets the value, and multiple rows or multiple columns return a clear SQLPage error. Migration notes:
+- **SQLPage function evaluation is now lazier.** A `sqlpage.*` call that is the whole value of a selected column now runs after the database query, once for each returned row. If the query returns no rows, the function is not called. Other SQLPage function calls still run before the query when their arguments do not depend on database columns. `SET x = (SELECT ...)` now has explicit scalar-query semantics: zero rows set `x` to `NULL`, one row with one column sets the value, multiple columns return a clear SQLPage error, and multiple rows follow the database's scalar-subquery behavior. Migration notes:
   -  `SELECT sqlpage.fetch('https://api.example.com') AS body FROM many_rows` will now make one HTTP request per row; use `SET body = sqlpage.fetch(...)` first for one request per page.
   - `SELECT sqlpage.exec('command') AS result FROM many_rows` will now run once per row; use `SET` first for once-per-page execution
   - `SELECT sqlpage.random_string(8) AS token FROM many_rows` now produces one token per row instead of one token reused across rows
