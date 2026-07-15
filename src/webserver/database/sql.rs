@@ -459,9 +459,47 @@ mod tests {
     }
 
     #[test]
+    fn positional_bindings_follow_rendered_projection_order() {
+        let database = database(SupportedDatabase::MySql);
+        let statement = parse_sql(
+            &database,
+            &MySqlDialect {},
+            "select $a as a, sqlpage.url_encode(upper(col || sqlpage.url_encode($b))) as b, $c as c from t",
+        )
+        .unwrap()
+        .next()
+        .unwrap();
+        let FileStatement::Query(Query {
+            body: QueryBody::Database(query),
+            ..
+        }) = statement
+        else {
+            panic!("expected database query");
+        };
+        assert_eq!(
+            query.bindings.as_ref(),
+            [
+                variable("a"),
+                variable("c"),
+                call(SqlPageFunctionName::url_encode, [variable("b")]),
+            ]
+        );
+    }
+
+    #[test]
     fn database_cannot_order_by_computed_column() {
         let FileStatement::Error(error) =
             one("select sqlpage.url_encode(value) as encoded from t order by encoded")
+        else {
+            panic!("expected rewrite error");
+        };
+        assert!(error.to_string().contains("ORDER BY"));
+    }
+
+    #[test]
+    fn database_cannot_order_by_ordinal_with_computed_columns() {
+        let FileStatement::Error(error) =
+            one("select a, sqlpage.url_encode(b) as encoded, c from t order by 3")
         else {
             panic!("expected rewrite error");
         };
