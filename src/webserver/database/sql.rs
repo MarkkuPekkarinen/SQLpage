@@ -323,6 +323,10 @@ fn expression_to_query(expression: Expr) -> Statement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::webserver::database::sqlpage_expr::{
+        RowInputId, SqlPageExpr, VariableRef, VariableSource,
+    };
+    use crate::webserver::database::sqlpage_functions::functions::SqlPageFunctionName;
     use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
     use sqlx::any::AnyKind;
 
@@ -350,6 +354,50 @@ mod tests {
         .unwrap()
         .next()
         .unwrap()
+    }
+
+    fn rewrite_database(sql: &str) -> DatabaseQuery {
+        let FileStatement::Query(Query {
+            body: QueryBody::Database(query),
+            ..
+        }) = one(sql)
+        else {
+            panic!("expected database query");
+        };
+        query
+    }
+
+    fn call<Input, const N: usize>(
+        function: SqlPageFunctionName,
+        arguments: [SqlPageExpr<Input>; N],
+    ) -> SqlPageExpr<Input> {
+        SqlPageExpr::Call {
+            function,
+            arguments: Box::new(arguments),
+        }
+    }
+
+    fn coalesce<Input, const N: usize>(arguments: [SqlPageExpr<Input>; N]) -> SqlPageExpr<Input> {
+        SqlPageExpr::Coalesce(Box::new(arguments))
+    }
+
+    fn concat<Input, const N: usize>(arguments: [SqlPageExpr<Input>; N]) -> SqlPageExpr<Input> {
+        SqlPageExpr::Concat(Box::new(arguments))
+    }
+
+    fn variable<Input>(name: &str) -> SqlPageExpr<Input> {
+        SqlPageExpr::Variable(VariableRef {
+            name: name.into(),
+            source: VariableSource::SetOrUrl,
+        })
+    }
+
+    fn row(index: usize) -> SqlPageExpr<RowInputId> {
+        SqlPageExpr::Input(RowInputId::new(index))
+    }
+
+    fn text<Input>(value: &str) -> SqlPageExpr<Input> {
+        SqlPageExpr::Literal(serde_json::Value::String(value.into()))
     }
 
     #[test]
@@ -488,5 +536,75 @@ mod tests {
             panic!("expected a single SQLPage-owned row");
         };
         assert_eq!(query.columns.len(), 1);
+    }
+
+    #[test]
+    fn mixed_database_and_row_boundaries_are_rewritten_together() {
+        assert_eq!(
+            rewrite_database(
+                "select coalesce(upper(sqlpage.url_encode($prefix)), sqlpage.url_encode(value)) as result from t"
+            ),
+            DatabaseQuery {
+                sql: "SELECT value AS \"__sqlpage_input_0\", upper(CAST($1 AS TEXT)) AS \"__sqlpage_input_1\" FROM t".into(),
+                bindings: Box::new([call(SqlPageFunctionName::url_encode, [variable("prefix")])]),
+                row_input_json: Box::new([false, false]),
+                computed_columns: Box::new([OutputColumn {
+                    name: "result".into(),
+                    value: coalesce([
+                        row(1),
+                        call(SqlPageFunctionName::url_encode, [row(0)]),
+                    ]),
+                }]),
+                json_columns: Box::new([]),
+            }
+        );
+    }
+
+    #[test]
+    fn predicate_call_is_standalone_while_projection_call_is_per_row() {
+        assert_eq!(
+            rewrite_database(
+                "select sqlpage.url_encode(value) as encoded from t where sqlpage.url_encode($expected) = 'x'"
+            ),
+            DatabaseQuery {
+                sql: "SELECT value AS \"__sqlpage_input_0\" FROM t WHERE CAST($1 AS TEXT) = 'x'"
+                    .into(),
+                bindings: Box::new([call(
+                    SqlPageFunctionName::url_encode,
+                    [variable("expected")]
+                )]),
+                row_input_json: Box::new([false]),
+                computed_columns: Box::new([OutputColumn {
+                    name: "encoded".into(),
+                    value: call(SqlPageFunctionName::url_encode, [row(0)]),
+                }]),
+                json_columns: Box::new([]),
+            }
+        );
+    }
+
+    #[test]
+    fn request_and_row_values_share_one_per_row_expression() {
+        assert_eq!(
+            rewrite_database(
+                "select coalesce(sqlpage.url_encode($prefix || value), '') as encoded from t"
+            ),
+            DatabaseQuery {
+                sql: "SELECT value AS \"__sqlpage_input_0\" FROM t".into(),
+                bindings: Box::new([]),
+                row_input_json: Box::new([false]),
+                computed_columns: Box::new([OutputColumn {
+                    name: "encoded".into(),
+                    value: coalesce([
+                        call(
+                            SqlPageFunctionName::url_encode,
+                            [concat([variable("prefix"), row(0)])],
+                        ),
+                        text(""),
+                    ]),
+                }]),
+                json_columns: Box::new([]),
+            }
+        );
     }
 }

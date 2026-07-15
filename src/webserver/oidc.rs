@@ -972,7 +972,7 @@ async fn execute_oidc_request_with_awc(
     let response = req.send_body(body).await.map_err(|e| {
         anyhow!(e.to_string()).context(format!(
             "Failed to send request: {} {}",
-            &req_head.method, &req_head.uri
+            req_head.method, req_head.uri
         ))
     })?;
     let head = response.headers();
@@ -991,7 +991,7 @@ async fn execute_oidc_request_with_awc(
     let body = response
         .body()
         .await
-        .with_context(|| format!("Couldnt read from {}", &req_head.uri))?;
+        .with_context(|| format!("Couldnt read from {}", req_head.uri))?;
     log::debug!("Received OIDC response body_len={} bytes", body.len());
     let resp = resp_builder.body(body.to_vec())?;
     Ok(resp)

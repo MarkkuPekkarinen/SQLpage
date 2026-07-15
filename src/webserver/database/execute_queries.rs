@@ -29,6 +29,8 @@ use sqlx::{
 
 pub type DbConn = Option<PoolConnection<sqlx::Any>>;
 
+/// One database result together with private values reserved for computed
+/// columns and therefore omitted from the user-visible row.
 struct QueryResult {
     item: DbItem,
     inputs: RowInputs,
@@ -753,6 +755,7 @@ fn decode_json_values(values: &mut [Value], json_flags: &[bool]) {
     }
 }
 
+/// Rewritten SQL and evaluated arguments in the form consumed by `sqlx`.
 pub struct BoundQuery<'a> {
     sql: &'a str,
     arguments: AnyArguments<'a>,
