@@ -476,6 +476,7 @@ fn can_build_standalone(expression: &SqlExpr) -> anyhow::Result<bool> {
             op: BinaryOperator::StringConcat,
             right,
         } => Ok(can_build_standalone(left)? && can_build_standalone(right)?),
+        SqlExpr::Nested(expression) => can_build_standalone(expression),
         _ => Ok(false),
     }
 }
@@ -522,6 +523,14 @@ impl QueryRewriter<'_> {
                     })),
                 }
             }
+            SqlExpr::Nested(expression) => match self.rewrite_projection(*expression)? {
+                RewrittenProjection::Database(expression) => Ok(RewrittenProjection::Database(
+                    SqlExpr::Nested(Box::new(expression)),
+                )),
+                RewrittenProjection::PerRow(expression) => {
+                    Ok(RewrittenProjection::PerRow(expression))
+                }
+            },
             mut expression => {
                 self.rewrite_database_expression(&mut expression)?;
                 Ok(RewrittenProjection::Database(expression))
@@ -814,6 +823,7 @@ fn build_sqlpage_expr<Environment: ExprEnvironment>(
                 .database_type
                 .concat_operator_null_behavior(),
         }),
+        SqlExpr::Nested(expression) => build_sqlpage_expr::<Environment>(rewriter, *expression),
         expression => Environment::use_database_expr(rewriter, expression),
     }
 }

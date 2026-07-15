@@ -434,6 +434,21 @@ mod tests {
     }
 
     #[test]
+    fn parentheses_keep_nested_call_per_row() {
+        let FileStatement::Query(Query {
+            body: QueryBody::Database(query),
+            ..
+        }) = one("select (sqlpage.url_encode(value)) as encoded from t")
+        else {
+            panic!("expected database query");
+        };
+        assert!(query.bindings.is_empty());
+        assert_eq!(query.row_input_json.len(), 1);
+        assert_eq!(query.computed_columns.len(), 1);
+        assert!(!query.sql.contains("sqlpage."));
+    }
+
+    #[test]
     fn row_value_cannot_cross_database_only_parent() {
         let FileStatement::Error(error) = one("select upper(sqlpage.url_encode(value)) from t")
         else {
