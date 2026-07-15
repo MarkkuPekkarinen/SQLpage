@@ -45,12 +45,17 @@ pub(in crate::webserver::database) struct DatabaseQuery {
     pub sql: String,
     /// Evaluated once, in placeholder order, before executing `sql`.
     pub bindings: Box<[StandaloneExpr]>,
-    /// JSON decoding flags for private columns appended to the projection.
-    /// The slice length is the private-column count.
-    pub row_input_json: Box<[bool]>,
+    /// Private columns in input-id order.
+    pub row_inputs: Box<[RowInputColumn]>,
     /// Evaluated once for every returned database row.
     pub computed_columns: Box<[OutputColumn<RowExpr>]>,
     pub json_columns: Box<[String]>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::webserver::database) struct RowInputColumn {
+    pub ordinal: usize,
+    pub decode_as_json: bool,
 }
 
 impl DatabaseQuery {

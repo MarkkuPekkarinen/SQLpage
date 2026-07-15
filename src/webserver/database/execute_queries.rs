@@ -594,9 +594,14 @@ fn parse_single_sql_result(
             if log::log_enabled!(log::Level::Trace) {
                 debug_row(&r);
             }
-            match super::sql_to_json::row_to_json_with_inputs(&r, query.row_input_json.len()) {
+            match super::sql_to_json::row_to_json_with_inputs(&r, &query.row_inputs) {
                 Ok((row, mut inputs)) => {
-                    decode_json_values(&mut inputs, &query.row_input_json);
+                    let decode_as_json = query
+                        .row_inputs
+                        .iter()
+                        .map(|input| input.decode_as_json)
+                        .collect::<Vec<_>>();
+                    decode_json_values(&mut inputs, &decode_as_json);
                     QueryResult {
                         item: DbItem::Row(row),
                         inputs: RowInputs::new(inputs),

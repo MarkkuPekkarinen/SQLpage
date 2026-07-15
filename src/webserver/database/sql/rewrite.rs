@@ -15,7 +15,8 @@ use sqlparser::tokenizer::Span;
 
 use super::dialect::{PlaceholderStyle, placeholder_style};
 use super::statement::{
-    DatabaseQuery, OutputColumn, Query, QueryBody, SingleRowQuery, SourceLocation, SourceSpan,
+    DatabaseQuery, OutputColumn, Query, QueryBody, RowInputColumn, SingleRowQuery, SourceLocation,
+    SourceSpan,
 };
 use super::{extract_json_columns, is_json_expression, is_sqlpage_func};
 use crate::webserver::database::sqlpage_expr::{
@@ -39,7 +40,7 @@ struct PendingBinding {
 struct QueryRewriter<'a> {
     database: &'a DbInfo,
     bindings: Vec<PendingBinding>,
-    row_input_json: Vec<bool>,
+    row_inputs: Vec<RowInputColumn>,
     private_projection: Vec<SelectItem>,
     error: Option<anyhow::Error>,
 }
@@ -123,7 +124,7 @@ pub(super) fn rewrite_query(
     let mut rewriter = QueryRewriter {
         database,
         bindings: Vec::new(),
-        row_input_json: Vec::new(),
+        row_inputs: Vec::new(),
         private_projection: Vec::new(),
         error: None,
     };
@@ -148,7 +149,10 @@ pub(super) fn rewrite_query(
             expr: SqlExpr::value(Value::Null),
             alias: Ident::with_quote('"', format!("{SQLPAGE_INPUT_PREFIX}anchor")),
         });
-        rewriter.row_input_json.push(false);
+        rewriter.row_inputs.push(RowInputColumn {
+            ordinal: 0,
+            decode_as_json: false,
+        });
     }
 
     let json_columns = extract_json_columns(&statement, database.database_type)
@@ -165,7 +169,7 @@ pub(super) fn rewrite_query(
         body: QueryBody::Database(DatabaseQuery {
             sql,
             bindings,
-            row_input_json: rewriter.row_input_json.into_boxed_slice(),
+            row_inputs: rewriter.row_inputs.into_boxed_slice(),
             computed_columns: computed_columns.into_boxed_slice(),
             json_columns,
         }),
@@ -174,7 +178,7 @@ pub(super) fn rewrite_query(
 }
 
 /// Removes SQLPage-owned projection expressions from the database projection
-/// and appends the private database inputs they require.
+/// and inserts their private database inputs at the same projection position.
 fn rewrite_top_level_projection(
     statement: &mut SqlStatement,
     rewriter: &mut QueryRewriter<'_>,
@@ -194,6 +198,7 @@ fn rewrite_top_level_projection(
 
     let mut database_projection = Vec::with_capacity(select.projection.len());
     for item in std::mem::take(&mut select.projection) {
+        let first_input = rewriter.row_inputs.len();
         match item {
             SelectItem::ExprWithAlias { expr, alias } => {
                 match rewriter.rewrite_projection(expr)? {
@@ -221,8 +226,12 @@ fn rewrite_top_level_projection(
             }
             item => database_projection.push(item),
         }
+        database_projection.append(&mut rewriter.private_projection);
+        let first_ordinal = database_projection.len() - (rewriter.row_inputs.len() - first_input);
+        for (offset, input) in rewriter.row_inputs[first_input..].iter_mut().enumerate() {
+            input.ordinal = first_ordinal + offset;
+        }
     }
-    database_projection.append(&mut rewriter.private_projection);
     select.projection = database_projection;
     let computed_names = computed_columns
         .iter()
@@ -485,13 +494,16 @@ impl QueryRewriter<'_> {
     fn add_row_input(&mut self, mut expression: SqlExpr) -> anyhow::Result<RowInputId> {
         let decode_as_json = is_json_expression(&expression);
         self.rewrite_database_expression(&mut expression)?;
-        let index = self.row_input_json.len();
+        let index = self.row_inputs.len();
         let name = format!("{SQLPAGE_INPUT_PREFIX}{index}");
         self.private_projection.push(SelectItem::ExprWithAlias {
             expr: expression,
             alias: Ident::with_quote('"', name),
         });
-        self.row_input_json.push(decode_as_json);
+        self.row_inputs.push(RowInputColumn {
+            ordinal: 0,
+            decode_as_json,
+        });
         Ok(RowInputId::new(index))
     }
 
