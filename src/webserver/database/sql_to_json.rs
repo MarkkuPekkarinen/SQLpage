@@ -237,7 +237,7 @@ mod tests {
     async fn private_inputs_are_split_from_the_trailing_suffix() -> anyhow::Result<()> {
         let db_url = test_database_url();
         let mut connection = sqlx::AnyConnection::connect(&db_url).await?;
-        let row = sqlx::query("SELECT 1 AS __sqlpage_input_0, 2 AS __sqlpage_input_0")
+        let row = sqlx::query("SELECT 1 AS \"__sqlpage_input_0\", 2 AS \"__sqlpage_input_0\"")
             .fetch_one(&mut connection)
             .await?;
         let (public, inputs) = row_to_json_with_inputs(&row, 1)?;
