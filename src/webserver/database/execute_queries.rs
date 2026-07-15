@@ -34,6 +34,7 @@ pub type DbConn = Option<PoolConnection<sqlx::Any>>;
 struct QueryResult {
     item: DbItem,
     inputs: RowInputs,
+    output_column_count: usize,
 }
 
 fn source_line_number(line: usize) -> i64 {
@@ -395,6 +396,7 @@ async fn execute_scalar_query<'a>(
         let QueryBody::SingleRow(single_row) = &statement.body else {
             unreachable!()
         };
+        ensure_scalar_column_count(single_row.columns.len())?;
         let row = execute_single_row(single_row, request, db_connection).await?;
         return scalar_value_from_row(DbItem::Row(row));
     };
@@ -423,6 +425,7 @@ async fn execute_scalar_query<'a>(
 
             let result =
                 parse_single_sql_result(source_file, database_query, statement.source_span, elem);
+            let output_column_count = result.output_column_count;
             match result.item {
                 row @ DbItem::Row(_) => {
                     returned_rows += 1;
@@ -439,6 +442,7 @@ async fn execute_scalar_query<'a>(
                     scalar_row = Some(QueryResult {
                         item: row,
                         inputs: result.inputs,
+                        output_column_count,
                     });
                     if scalar_subquery_behavior == ScalarSubqueryBehavior::FirstRow {
                         break;
@@ -460,6 +464,7 @@ async fn execute_scalar_query<'a>(
             record_error_and_rollback(connection, &query_metrics, returned_rows, error).await,
         );
     } else if let Some(mut row) = scalar_row {
+        ensure_scalar_column_count(row.output_column_count)?;
         apply_json_columns(&mut row.item, &database_query.json_columns);
         if let Err(error) = evaluate_computed_columns(
             request,
@@ -503,14 +508,19 @@ fn scalar_value_from_row(item: DbItem) -> anyhow::Result<Option<String>> {
     let DbItem::Row(Value::Object(row)) = item else {
         anyhow::bail!("SET scalar query did not return a row object");
     };
-    match row.len() {
+    ensure_scalar_column_count(row.len())?;
+    Ok(row
+        .into_iter()
+        .next()
+        .and_then(|(_, value)| json_to_scalar_string(value)))
+}
+
+fn ensure_scalar_column_count(column_count: usize) -> anyhow::Result<()> {
+    match column_count {
         0 => anyhow::bail!(
             "SET scalar query returned no columns. A SET subquery must select exactly one column."
         ),
-        1 => Ok(row
-            .into_iter()
-            .next()
-            .and_then(|(_, v)| json_to_scalar_string(v))),
+        1 => Ok(()),
         _ => anyhow::bail!(
             "SET scalar query returned more than one column. A SET subquery must select exactly one column."
         ),
@@ -618,11 +628,14 @@ fn parse_single_sql_result(
                     QueryResult {
                         item: DbItem::Row(row),
                         inputs: RowInputs::new(inputs),
+                        output_column_count: r.columns().len() - query.row_inputs.len()
+                            + query.computed_columns.len(),
                     }
                 }
                 Err(error) => QueryResult {
                     item: DbItem::Error(error),
                     inputs: RowInputs::new(Vec::new()),
+                    output_column_count: 0,
                 },
             }
         }
@@ -631,6 +644,7 @@ fn parse_single_sql_result(
             QueryResult {
                 item: DbItem::FinishedQuery,
                 inputs: RowInputs::new(Vec::new()),
+                output_column_count: 0,
             }
         }
         Err(err) => {
@@ -638,6 +652,7 @@ fn parse_single_sql_result(
             QueryResult {
                 item: DbItem::Error(nice_err),
                 inputs: RowInputs::new(Vec::new()),
+                output_column_count: 0,
             }
         }
     }
