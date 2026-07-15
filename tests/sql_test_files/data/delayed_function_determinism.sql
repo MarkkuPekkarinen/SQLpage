@@ -1,4 +1,4 @@
-set x = (select sqlpage.fetch('invalid') where false);
+set x = (select sqlpage.fetch('invalid') where 1 = 0);
 select null as expected, $x as actual;
 
 set x = (select sqlpage.url_encode(' ') where true);
