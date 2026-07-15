@@ -218,7 +218,20 @@ fn assert_html_test(body: &str, test_file: &std::path::Path, stem: &str) {
     );
 
     if stem.starts_with("error_") {
-        let expected = stem.strip_prefix("error_").unwrap().replace('_', " ");
+        let mut expected = stem.strip_prefix("error_").unwrap().to_owned();
+        for database in [
+            "sqlite",
+            "duckdb",
+            "oracle",
+            "postgres",
+            "mysql",
+            "mssql",
+            "snowflake",
+            "generic",
+        ] {
+            expected = expected.replace(&format!("_no{database}"), "");
+        }
+        let expected = expected.replace('_', " ");
         assert!(
             body.to_lowercase().contains(&expected.to_lowercase()),
             "Should contain '{}': {}",

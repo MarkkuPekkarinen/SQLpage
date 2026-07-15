@@ -20,7 +20,7 @@ use crate::webserver::ErrorWithStatus;
 use crate::webserver::http_request_info::ExecutionContext;
 use crate::webserver::single_or_vec::SingleOrVec;
 
-use super::{Database, DbItem, error_highlighting::display_db_error};
+use super::{Database, DbItem, ScalarSubqueryBehavior, error_highlighting::display_db_error};
 use sqlx::any::{AnyArguments, AnyQueryResult, AnyRow, AnyStatement, AnyTypeInfo};
 use sqlx::pool::PoolConnection;
 use sqlx::{
@@ -406,6 +406,12 @@ async fn execute_scalar_query<'a>(
     let mut scalar_row = None;
     let mut returned_rows: i64 = 0;
     let mut error = None;
+    let scalar_subquery_behavior = request
+        .app_state
+        .db
+        .info
+        .database_type
+        .scalar_subquery_behavior();
     {
         let connection = take_connection(&request.app_state.db, db_connection, request).await?;
         let mut stream = connection.fetch_many(query);
@@ -421,6 +427,10 @@ async fn execute_scalar_query<'a>(
                 row @ DbItem::Row(_) => {
                     returned_rows += 1;
                     if scalar_row.is_some() {
+                        debug_assert_eq!(
+                            scalar_subquery_behavior,
+                            ScalarSubqueryBehavior::ErrorOnMultipleRows
+                        );
                         error = Some(anyhow!(
                             "SET scalar query returned more than one row. A SET subquery must return zero or one row."
                         ));
@@ -430,6 +440,9 @@ async fn execute_scalar_query<'a>(
                         item: row,
                         inputs: result.inputs,
                     });
+                    if scalar_subquery_behavior == ScalarSubqueryBehavior::FirstRow {
+                        break;
+                    }
                 }
                 DbItem::FinishedQuery => {}
                 DbItem::Error(err) => {

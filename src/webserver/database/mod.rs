@@ -27,6 +27,12 @@ pub enum SupportedDatabase {
     Generic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarSubqueryBehavior {
+    FirstRow,
+    ErrorOnMultipleRows,
+}
+
 impl SupportedDatabase {
     /// Detect the database type from a connection's `dbms_name`
     #[must_use]
@@ -76,6 +82,14 @@ impl SupportedDatabase {
             Self::Mssql => "microsoft.sql_server",
             Self::Snowflake => "snowflake",
             Self::Generic => "other_sql",
+        }
+    }
+
+    /// Mirrors how the backend handles a scalar subquery that returns multiple rows.
+    fn scalar_subquery_behavior(self) -> ScalarSubqueryBehavior {
+        match self {
+            Self::Sqlite => ScalarSubqueryBehavior::FirstRow,
+            _ => ScalarSubqueryBehavior::ErrorOnMultipleRows,
         }
     }
 }
@@ -135,5 +149,32 @@ pub fn make_placeholder(dbms: AnyKind, arg_number: usize) -> String {
         AnyKind::Postgres => format!("${arg_number}"),
         AnyKind::Mssql => format!("@p{arg_number}"),
         AnyKind::MySql | AnyKind::Odbc => "?".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ScalarSubqueryBehavior, SupportedDatabase};
+
+    #[test]
+    fn scalar_subquery_behavior_matches_backends() {
+        assert_eq!(
+            SupportedDatabase::Sqlite.scalar_subquery_behavior(),
+            ScalarSubqueryBehavior::FirstRow
+        );
+        for database in [
+            SupportedDatabase::Duckdb,
+            SupportedDatabase::Oracle,
+            SupportedDatabase::Postgres,
+            SupportedDatabase::MySql,
+            SupportedDatabase::Mssql,
+            SupportedDatabase::Snowflake,
+            SupportedDatabase::Generic,
+        ] {
+            assert_eq!(
+                database.scalar_subquery_behavior(),
+                ScalarSubqueryBehavior::ErrorOnMultipleRows
+            );
+        }
     }
 }
