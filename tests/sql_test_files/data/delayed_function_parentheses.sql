@@ -3,4 +3,4 @@ select
     '%20' as expected
 from (
     select ' ' as space
-) AS subquery;
+) subquery;
