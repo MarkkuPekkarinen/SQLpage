@@ -85,7 +85,7 @@ pub mod webserver;
 
 use crate::app_config::AppConfig;
 use crate::filesystem::FileSystem;
-use crate::webserver::database::ParsedSqlFile;
+use crate::webserver::database::SqlFile;
 use crate::webserver::oidc::OidcState;
 use file_cache::FileCache;
 use std::path::{Path, PathBuf};
@@ -106,7 +106,7 @@ pub const DEFAULT_404_FILE: &str = "default_404.sql";
 pub struct AppState {
     pub db: Database,
     all_templates: AllTemplates,
-    sql_file_cache: FileCache<ParsedSqlFile>,
+    sql_file_cache: FileCache<SqlFile>,
     file_system: FileSystem,
     config: AppConfig,
     pub oidc_state: Option<Arc<OidcState>>,
@@ -124,11 +124,11 @@ impl AppState {
         let file_system = FileSystem::init(&config.web_root, &db).await;
         sql_file_cache.add_static(
             PathBuf::from("index.sql"),
-            ParsedSqlFile::new(&db, include_str!("index.sql"), Path::new("index.sql")),
+            SqlFile::new(&db, include_str!("index.sql"), Path::new("index.sql")),
         );
         sql_file_cache.add_static(
             PathBuf::from(DEFAULT_404_FILE),
-            ParsedSqlFile::new(
+            SqlFile::new(
                 &db,
                 include_str!("default_404.sql"),
                 Path::new(DEFAULT_404_FILE),

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::sql::{SourceSpan, StmtWithParams};
+use super::sql::SourceSpan;
 
 #[derive(Debug)]
 struct NiceDatabaseError {
@@ -114,14 +114,15 @@ pub fn display_db_error(
 #[must_use]
 pub fn display_stmt_db_error(
     source_file: &Path,
-    stmt: &StmtWithParams,
+    query: &str,
+    query_position: SourceSpan,
     db_err: sqlx::error::Error,
 ) -> anyhow::Error {
     anyhow::Error::new(NiceDatabaseError {
         source_file: source_file.to_path_buf(),
         db_err,
-        query: stmt.query.clone(),
-        query_position: Some(stmt.query_position),
+        query: query.to_owned(),
+        query_position: Some(query_position),
     })
 }
 

@@ -4,14 +4,13 @@ mod csv_import;
 pub mod execute_queries;
 pub mod migrations;
 mod sql;
+mod sqlpage_expr;
 mod sqlpage_functions;
-mod syntax_tree;
 
 mod error_highlighting;
 mod sql_to_json;
 
-pub use sql::ParsedSqlFile;
-use sql::{DB_PLACEHOLDERS, DbPlaceHolder};
+pub use sql::SqlFile;
 use sqlx::any::AnyKind;
 // SupportedDatabase is defined in this module
 
@@ -131,12 +130,10 @@ impl std::fmt::Display for Database {
 #[inline]
 #[must_use]
 pub fn make_placeholder(dbms: AnyKind, arg_number: usize) -> String {
-    if let Some((_, placeholder)) = DB_PLACEHOLDERS.iter().find(|(kind, _)| *kind == dbms) {
-        match *placeholder {
-            DbPlaceHolder::PrefixedNumber { prefix } => format!("{prefix}{arg_number}"),
-            DbPlaceHolder::Positional { placeholder } => placeholder.to_string(),
-        }
-    } else {
-        unreachable!("missing dbms: {dbms:?} in DB_PLACEHOLDERS ({DB_PLACEHOLDERS:?})")
+    match dbms {
+        AnyKind::Sqlite => format!("?{arg_number}"),
+        AnyKind::Postgres => format!("${arg_number}"),
+        AnyKind::Mssql => format!("@p{arg_number}"),
+        AnyKind::MySql | AnyKind::Odbc => "?".to_owned(),
     }
 }

@@ -9,7 +9,7 @@ use crate::webserver::database::execute_queries::stop_at_first_error;
 use crate::webserver::database::{DbItem, execute_queries::stream_query_results_with_conn};
 use crate::webserver::http_request_info::extract_request_info;
 use crate::webserver::server_timing::ServerTiming;
-use crate::{AppConfig, AppState, DEFAULT_404_FILE, ParsedSqlFile};
+use crate::{AppConfig, AppState, DEFAULT_404_FILE, SqlFile};
 use actix_web::dev::{ServiceFactory, ServiceRequest, fn_service};
 use actix_web::error::{ErrorBadRequest, ErrorInternalServerError};
 use actix_web::http::header::Accept;
@@ -209,7 +209,7 @@ enum ResponseWithWriter<S> {
 
 async fn render_sql(
     srv_req: &mut ServiceRequest,
-    sql_file: Arc<ParsedSqlFile>,
+    sql_file: Arc<SqlFile>,
     server_timing: ServerTiming,
 ) -> actix_web::Result<HttpResponse> {
     let app_state = srv_req
