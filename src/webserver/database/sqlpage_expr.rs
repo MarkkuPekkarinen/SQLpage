@@ -27,10 +27,19 @@ pub(crate) enum SqlPageExpr<Input> {
         function: SqlPageFunctionName,
         arguments: Box<[Self]>,
     },
-    Concat(Box<[Self]>),
+    Concat {
+        arguments: Box<[Self]>,
+        null_behavior: ConcatNullBehavior,
+    },
     Coalesce(Box<[Self]>),
     JsonObject(Box<[(Self, Self)]>),
     JsonArray(Box<[Self]>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConcatNullBehavior {
+    IgnoreNull,
+    PropagateNull,
 }
 
 /// Uninhabited input type for expressions that cannot read a database row.
@@ -235,14 +244,20 @@ impl<Input> SqlPageExpr<Input> {
                     .with_context(|| format!("Error in function call {function}"))?;
                 Ok(result.map_or(SqlPageValue::Null, SqlPageValue::Text))
             }
-            Self::Concat(arguments) => {
+            Self::Concat {
+                arguments,
+                null_behavior,
+            } => {
                 let mut result = String::new();
                 for argument in arguments {
                     let value = Box::pin(argument.evaluate(request, db_connection, inputs)).await?;
-                    let Some(value) = value.into_function_argument() else {
-                        return Ok(SqlPageValue::Null);
-                    };
-                    result.push_str(&value);
+                    match value.into_function_argument() {
+                        Some(value) => result.push_str(&value),
+                        None if *null_behavior == ConcatNullBehavior::PropagateNull => {
+                            return Ok(SqlPageValue::Null);
+                        }
+                        None => {}
+                    }
                 }
                 Ok(SqlPageValue::Text(Cow::Owned(result)))
             }
@@ -295,11 +310,11 @@ impl<Input> SqlPageExpr<Input> {
                         .iter()
                         .any(|argument| argument.contains_function(expected))
             }
-            Self::Concat(arguments) | Self::Coalesce(arguments) | Self::JsonArray(arguments) => {
-                arguments
-                    .iter()
-                    .any(|argument| argument.contains_function(expected))
-            }
+            Self::Concat { arguments, .. }
+            | Self::Coalesce(arguments)
+            | Self::JsonArray(arguments) => arguments
+                .iter()
+                .any(|argument| argument.contains_function(expected)),
             Self::JsonObject(entries) => entries.iter().any(|(key, value)| {
                 key.contains_function(expected) || value.contains_function(expected)
             }),

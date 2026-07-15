@@ -324,7 +324,7 @@ fn expression_to_query(expression: Expr) -> Statement {
 mod tests {
     use super::*;
     use crate::webserver::database::sqlpage_expr::{
-        RowInputId, SqlPageExpr, VariableRef, VariableSource,
+        ConcatNullBehavior, RowInputId, SqlPageExpr, VariableRef, VariableSource,
     };
     use crate::webserver::database::sqlpage_functions::functions::SqlPageFunctionName;
     use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
@@ -382,7 +382,10 @@ mod tests {
     }
 
     fn concat<Input, const N: usize>(arguments: [SqlPageExpr<Input>; N]) -> SqlPageExpr<Input> {
-        SqlPageExpr::Concat(Box::new(arguments))
+        SqlPageExpr::Concat {
+            arguments: Box::new(arguments),
+            null_behavior: ConcatNullBehavior::PropagateNull,
+        }
     }
 
     fn variable<Input>(name: &str) -> SqlPageExpr<Input> {

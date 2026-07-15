@@ -20,7 +20,8 @@ use super::statement::{
 };
 use super::{extract_json_columns, is_json_expression, is_sqlpage_func};
 use crate::webserver::database::sqlpage_expr::{
-    NoRowInput, RowExpr, RowInputId, SqlPageExpr, StandaloneExpr, VariableRef, VariableSource,
+    ConcatNullBehavior, NoRowInput, RowExpr, RowInputId, SqlPageExpr, StandaloneExpr, VariableRef,
+    VariableSource,
 };
 use crate::webserver::database::sqlpage_functions::functions::SqlPageFunctionName;
 use crate::webserver::database::{DbInfo, SupportedDatabase};
@@ -414,13 +415,14 @@ impl QueryRewriter<'_> {
                             right: Box::new(right),
                         }))
                     }
-                    (left, right) => Ok(RewrittenProjection::PerRow(SqlPageExpr::Concat(
-                        vec![
+                    (left, right) => Ok(RewrittenProjection::PerRow(SqlPageExpr::Concat {
+                        arguments: vec![
                             self.projection_into_row_expr(left)?,
                             self.projection_into_row_expr(right)?,
                         ]
                         .into_boxed_slice(),
-                    ))),
+                        null_behavior: ConcatNullBehavior::PropagateNull,
+                    })),
                 }
             }
             mut expression => {
@@ -461,7 +463,9 @@ impl QueryRewriter<'_> {
             .map(|argument| self.projection_into_row_expr(argument))
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(RewrittenProjection::PerRow(build_emulated(
-            kind, arguments,
+            kind,
+            arguments,
+            self.database.database_type,
         )?))
     }
 
@@ -657,7 +661,7 @@ fn build_sqlpage_expr<Environment: ExprEnvironment>(
                     .into_iter()
                     .map(|argument| build_sqlpage_expr::<Environment>(rewriter, argument))
                     .collect::<anyhow::Result<Vec<_>>>()?;
-                build_emulated(kind, arguments)
+                build_emulated(kind, arguments, rewriter.database.database_type)
             } else {
                 Environment::use_database_expr(rewriter, SqlExpr::Function(function))
             }
@@ -666,13 +670,14 @@ fn build_sqlpage_expr<Environment: ExprEnvironment>(
             left,
             op: BinaryOperator::StringConcat,
             right,
-        } => Ok(SqlPageExpr::Concat(
-            vec![
+        } => Ok(SqlPageExpr::Concat {
+            arguments: vec![
                 build_sqlpage_expr::<Environment>(rewriter, *left)?,
                 build_sqlpage_expr::<Environment>(rewriter, *right)?,
             ]
             .into_boxed_slice(),
-        )),
+            null_behavior: ConcatNullBehavior::PropagateNull,
+        }),
         expression => Environment::use_database_expr(rewriter, expression),
     }
 }
@@ -680,9 +685,13 @@ fn build_sqlpage_expr<Environment: ExprEnvironment>(
 fn build_emulated<Input>(
     kind: EmulatedFunction,
     arguments: Vec<SqlPageExpr<Input>>,
+    database: SupportedDatabase,
 ) -> anyhow::Result<SqlPageExpr<Input>> {
     Ok(match kind {
-        EmulatedFunction::Concat => SqlPageExpr::Concat(arguments.into_boxed_slice()),
+        EmulatedFunction::Concat => SqlPageExpr::Concat {
+            arguments: arguments.into_boxed_slice(),
+            null_behavior: database.concat_function_null_behavior(),
+        },
         EmulatedFunction::Coalesce => SqlPageExpr::Coalesce(arguments.into_boxed_slice()),
         EmulatedFunction::JsonArray => SqlPageExpr::JsonArray(arguments.into_boxed_slice()),
         EmulatedFunction::JsonObject => {

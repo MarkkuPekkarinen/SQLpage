@@ -92,6 +92,15 @@ impl SupportedDatabase {
             _ => ScalarSubqueryBehavior::ErrorOnMultipleRows,
         }
     }
+
+    fn concat_function_null_behavior(self) -> sqlpage_expr::ConcatNullBehavior {
+        use sqlpage_expr::ConcatNullBehavior::{IgnoreNull, PropagateNull};
+
+        match self {
+            Self::Sqlite | Self::Duckdb | Self::Oracle | Self::Postgres | Self::Mssql => IgnoreNull,
+            Self::MySql | Self::Snowflake | Self::Generic => PropagateNull,
+        }
+    }
 }
 
 impl From<AnyKind> for SupportedDatabase {
@@ -154,6 +163,7 @@ pub fn make_placeholder(dbms: AnyKind, arg_number: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::sqlpage_expr::ConcatNullBehavior::{IgnoreNull, PropagateNull};
     use super::{ScalarSubqueryBehavior, SupportedDatabase};
 
     #[test]
@@ -175,6 +185,26 @@ mod tests {
                 database.scalar_subquery_behavior(),
                 ScalarSubqueryBehavior::ErrorOnMultipleRows
             );
+        }
+    }
+
+    #[test]
+    fn concat_null_behavior_matches_backends() {
+        for database in [
+            SupportedDatabase::Sqlite,
+            SupportedDatabase::Duckdb,
+            SupportedDatabase::Oracle,
+            SupportedDatabase::Postgres,
+            SupportedDatabase::Mssql,
+        ] {
+            assert_eq!(database.concat_function_null_behavior(), IgnoreNull);
+        }
+        for database in [
+            SupportedDatabase::MySql,
+            SupportedDatabase::Snowflake,
+            SupportedDatabase::Generic,
+        ] {
+            assert_eq!(database.concat_function_null_behavior(), PropagateNull);
         }
     }
 }
