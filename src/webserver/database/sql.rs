@@ -605,6 +605,16 @@ mod tests {
     }
 
     #[test]
+    fn database_cannot_filter_by_computed_column_in_where() {
+        let FileStatement::Error(error) =
+            one("select sqlpage.url_encode(name) as enc from users where enc <> ''")
+        else {
+            panic!("expected rewrite error");
+        };
+        assert!(error.to_string().contains("WHERE"));
+    }
+
+    #[test]
     fn database_cannot_group_by_computed_column_in_expression() {
         let FileStatement::Error(error) =
             one("select sqlpage.url_encode(name) as enc, count(*) from users group by lower(enc)")

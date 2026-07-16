@@ -227,6 +227,7 @@ fn rewrite_top_level_projection(
     database_projection.append(&mut rewriter.private_projection);
     select.projection = database_projection;
 
+    reject_computed_alias_references("WHERE", select.selection.as_ref(), &computed_columns)?;
     reject_computed_group_by_references(&select.group_by, &computed_columns)?;
     reject_computed_alias_references("HAVING", select.having.as_ref(), &computed_columns)?;
     reject_computed_alias_references("QUALIFY", select.qualify.as_ref(), &computed_columns)?;
