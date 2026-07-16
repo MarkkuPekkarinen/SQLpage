@@ -18,12 +18,20 @@ select '
 In addition to normal SQL functions supported by your database,
 SQLPage provides a few special functions to help you extract data from user requests.
 
-These functions are special, because they are not executed inside your database,
-but by SQLPage itself before sending the query to your database.
-Thus, they require all the parameters to be known at the time the query is sent to your database.
-Function parameters cannot reference columns from the rest of your query.
-The only case when you can call a SQLPage function with a parameter that is not a constant is when it appears at the top level of a `SELECT` statement.
-For example, `SELECT sqlpage.url_encode(url) FROM t` is allowed because SQLPage can execute `SELECT url FROM t` and then apply the `url_encode` function to each value.
+These functions are special because they are not database functions.
+SQLPage evaluates them itself, either before or after the database query.
+
+When a SQLPage function call is the whole value of a selected column, SQLPage first lets the database decide which rows exist.
+It selects the function arguments as hidden columns, then calls the SQLPage function once for each returned row.
+For example, `SELECT sqlpage.url_encode(url) AS encoded FROM t` runs the database query first, then applies `url_encode` to every returned `url` value.
+If the query returns no row, the function is not called.
+This also applies inside scalar `SET` subqueries, for instance `SET body = (SELECT sqlpage.fetch(url) FROM cache_misses WHERE enabled)`.
+
+In other positions, SQLPage functions run before the query, but only when their arguments can be evaluated without reading database columns.
+For instance, `WHERE sqlpage.cookie(''x'') = ''1''` can run before the query, but `WHERE sqlpage.fetch(url) IS NOT NULL` cannot because `url` is a database column.
+
+If a SQLPage function is expensive or has side effects and should run only once, store its result with `SET` first and reuse the variable.
+If a function should run only when a database row exists, put it as a standalone selected column in that row-producing query.
 
 For more information about how SQLPage functions are evaluated, and data types in SQLPage, read [the SQLPage data model documentation](/extensions-to-sql).
 ' as contents_md where $function IS NULL;

@@ -57,7 +57,7 @@ impl ::std::str::FromStr for SqlPageFunctionName {
         SqlPageFunctionName::ALL
             .iter()
             .copied()
-            .find(|function| function.name() == name)
+            .find(|function| function.name().eq_ignore_ascii_case(name))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Unknown function {name:?}. Supported functions:\n{}",

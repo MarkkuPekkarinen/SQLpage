@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::sql::{SourceSpan, StmtWithParams};
+use super::sql::SourceSpan;
 
 #[derive(Debug)]
 struct NiceDatabaseError {
@@ -84,7 +84,7 @@ struct NicePositionedError {
 
 impl std::fmt::Display for NicePositionedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "In \"{}\": {}", self.source_file.display(), self.error)?;
+        write!(f, "In \"{}\": {:#}", self.source_file.display(), self.error)?;
         write_source_position_info(f, &self.source_file, Some(self.query_position))
     }
 }
@@ -114,14 +114,15 @@ pub fn display_db_error(
 #[must_use]
 pub fn display_stmt_db_error(
     source_file: &Path,
-    stmt: &StmtWithParams,
+    query: &str,
+    query_position: SourceSpan,
     db_err: sqlx::error::Error,
 ) -> anyhow::Error {
     anyhow::Error::new(NiceDatabaseError {
         source_file: source_file.to_path_buf(),
         db_err,
-        query: stmt.query.clone(),
-        query_position: Some(stmt.query_position),
+        query: query.to_owned(),
+        query_position: Some(query_position),
     })
 }
 
@@ -182,6 +183,23 @@ fn test_display_stmt_error_includes_file_and_line() {
     let message = err.to_string();
     assert!(message.contains("In \"example.sql\": boom"));
     assert!(message.contains("example.sql: line 12"));
+}
+
+#[test]
+fn test_display_stmt_error_includes_error_chain() {
+    let err = display_stmt_error(
+        Path::new("example.sql"),
+        SourceSpan {
+            start: super::sql::SourceLocation { line: 4, column: 1 },
+            end: super::sql::SourceLocation {
+                line: 4,
+                column: 20,
+            },
+        },
+        anyhow::anyhow!("native database error").context("Failed to set variable x"),
+    );
+    let message = err.to_string();
+    assert!(message.contains("Failed to set variable x: native database error"));
 }
 
 #[test]

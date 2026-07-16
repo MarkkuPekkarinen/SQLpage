@@ -10,18 +10,17 @@ use tracing::Instrument;
 use super::csv_import::run_csv_import;
 use super::error_highlighting::{display_stmt_db_error, display_stmt_error};
 use super::sql::{
-    DelayedFunctionCall, ParsedSqlFile, ParsedStatement, SimpleSelectValue, StmtWithParams,
+    DatabaseQuery, FileStatement, OutputColumn, Query, QueryBody, SingleRowQuery, SourceSpan,
+    SqlFile,
 };
+use super::sqlpage_expr::{NoInputs, RowExpr, RowInputs};
 use crate::dynamic_component::parse_dynamic_rows;
 use crate::utils::add_value_to_map;
 use crate::webserver::ErrorWithStatus;
-use crate::webserver::database::sql_to_json::row_to_string;
 use crate::webserver::http_request_info::ExecutionContext;
-use crate::webserver::request_variables::SetVariablesMap;
 use crate::webserver::single_or_vec::SingleOrVec;
 
-use super::syntax_tree::{StmtParam, extract_req_param};
-use super::{Database, DbItem, error_highlighting::display_db_error};
+use super::{Database, DbItem, ScalarSubqueryBehavior, error_highlighting::display_db_error};
 use sqlx::any::{AnyArguments, AnyQueryResult, AnyRow, AnyStatement, AnyTypeInfo};
 use sqlx::pool::PoolConnection;
 use sqlx::{
@@ -29,6 +28,14 @@ use sqlx::{
 };
 
 pub type DbConn = Option<PoolConnection<sqlx::Any>>;
+
+/// One database result together with private values reserved for computed
+/// columns and therefore omitted from the user-visible row.
+struct QueryResult {
+    item: DbItem,
+    inputs: RowInputs,
+    output_column_count: usize,
+}
 
 fn source_line_number(line: usize) -> i64 {
     i64::try_from(line).unwrap_or(i64::MAX)
@@ -135,6 +142,29 @@ fn create_db_query_span(
     (span, operation_name)
 }
 
+fn create_query_metrics<'a>(
+    request: &'a ExecutionContext,
+    source_file: &Path,
+    source_span: SourceSpan,
+    query: &BoundQuery<'_>,
+) -> (tracing::Span, DbQueryMetricsContext<'a>) {
+    let db_system_name = request.app_state.db.info.database_type.otel_name();
+    let (query_span, operation_name) = create_db_query_span(
+        query.sql,
+        source_file,
+        source_span.start.line,
+        db_system_name,
+    );
+    let query_metrics = DbQueryMetricsContext::new(
+        query_span.clone(),
+        operation_name,
+        db_system_name,
+        &request.app_state.telemetry_metrics,
+    );
+    record_query_params(&query_metrics.span, &query.param_values);
+    (query_span, query_metrics)
+}
+
 impl Database {
     pub(crate) async fn prepare_with(
         &self,
@@ -149,8 +179,9 @@ impl Database {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Keeps the single-connection statement dispatcher together.
 pub fn stream_query_results_with_conn<'a>(
-    sql_file: &'a ParsedSqlFile,
+    sql_file: &'a SqlFile,
     request: &'a ExecutionContext,
     db_connection: &'a mut DbConn,
 ) -> impl Stream<Item = DbItem> + 'a {
@@ -158,91 +189,101 @@ pub fn stream_query_results_with_conn<'a>(
     async_stream::try_stream! {
         for res in &sql_file.statements {
             match res {
-                ParsedStatement::CsvImport(csv_import) => {
+                FileStatement::CsvImport(csv_import) => {
                     let connection = take_connection(&request.app_state.db, db_connection, request).await?;
                     log::debug!("Executing CSV import: {csv_import:?}");
                     run_csv_import(connection, csv_import, request).await.with_context(|| format!("Failed to import the CSV file {:?} into the table {:?}", csv_import.uploaded_file, csv_import.table_name))?;
                 },
-                ParsedStatement::StmtWithParams(stmt) => {
-                    let query = bind_parameters(stmt, request, db_connection)
+                FileStatement::Query(statement) => match &statement.body {
+                  QueryBody::SingleRow(query) => {
+                    let row = execute_single_row(query, request, db_connection)
                         .await
-                        .map_err(|e| with_stmt_position(source_file, stmt.query_position, e))?;
+                        .map_err(|error| with_stmt_position(source_file, statement.source_span, error))?;
+                    for item in parse_dynamic_rows(DbItem::Row(row)) {
+                        yield item;
+                    }
+                  }
+                  QueryBody::Database(stmt) => {
+                    let query = bind_query(stmt, request, db_connection)
+                        .await
+                        .map_err(|error| with_stmt_position(source_file, statement.source_span, error))?;
                     request.server_timing.record("bind_params");
-                    let connection = take_connection(&request.app_state.db, db_connection, request).await?;
                     log::trace!("Executing query {:?}", query.sql);
-                    let db_system_name = request.app_state.db.info.database_type.otel_name();
-                    let (query_span, operation_name) = create_db_query_span(
-                        query.sql,
-                        source_file,
-                        stmt.query_position.start.line,
-                        db_system_name,
-                    );
-                    let mut query_metrics = DbQueryMetricsContext::new(
-                        query_span.clone(),
-                        operation_name,
-                        db_system_name,
-                        &request.app_state.telemetry_metrics,
-                    );
-                    record_query_params(&query_metrics.span, &query.param_values);
-                    let mut stream = connection.fetch_many(query);
+                    let (query_span, mut query_metrics) = create_query_metrics(request, source_file, statement.source_span, &query);
                     let mut error = None;
                     let mut returned_rows: i64 = 0;
-                    loop {
+                    let buffer_rows = stmt.must_buffer_rows();
+                    let mut deferred_query_results = Vec::new();
+                    {
+                        let connection = take_connection(&request.app_state.db, db_connection, request).await?;
+                        let mut stream = connection.fetch_many(query);
+                        loop {
                         let start_next = std::time::Instant::now();
                         let next_elem = stream.next().instrument(query_span.clone()).await;
                         query_metrics.add_duration(start_next.elapsed());
                         let Some(elem) = next_elem else { break; };
 
-                        let mut query_result = parse_single_sql_result(source_file, stmt, elem);
-                        if let DbItem::Error(e) = query_result {
+                        let mut query_result = parse_single_sql_result(source_file, stmt, statement.source_span, elem);
+                        if let DbItem::Error(e) = query_result.item {
                             error = Some(e);
                             break;
                         }
-                        if matches!(query_result, DbItem::Row(_)) {
+                        if matches!(query_result.item, DbItem::Row(_)) {
                             returned_rows += 1;
                         }
-                        apply_json_columns(&mut query_result, &stmt.json_columns);
-                        if let Err(err) = apply_delayed_functions(request, &stmt.delayed_functions, &mut query_result)
+                        apply_json_columns(&mut query_result.item, &stmt.json_columns);
+                        if buffer_rows {
+                            deferred_query_results.push(query_result);
+                        } else {
+                            let mut computed_connection = None;
+                            if let Err(err) = evaluate_computed_columns(request, &stmt.computed_columns, &mut query_result, &mut computed_connection)
+                                .instrument(query_span.clone())
+                                .await
+                            {
+                                error = Some(err);
+                                break;
+                            }
+                            for db_item in parse_dynamic_rows(query_result.item) {
+                                yield db_item;
+                            }
+                        }
+                        }
+                        drop(stream);
+                    }
+                    if error.is_none() && buffer_rows {
+                        for mut query_result in deferred_query_results {
+                            if let Err(err) = evaluate_computed_columns(
+                                request,
+                                &stmt.computed_columns,
+                                &mut query_result,
+                                db_connection,
+                            )
                             .instrument(query_span.clone())
                             .await
-                        {
-                            error = Some(err);
-                            break;
-                        }
-                        for db_item in parse_dynamic_rows(query_result) {
-                            yield db_item;
+                            {
+                                error = Some(err);
+                                break;
+                            }
+                            for db_item in parse_dynamic_rows(query_result.item) {
+                                yield db_item;
+                            }
                         }
                     }
-                    drop(stream);
                     if let Some(error) = error {
-                        query_metrics.record_error(returned_rows, &error);
-                        try_rollback_transaction(connection).await;
+                        let connection = take_connection(&request.app_state.db, db_connection, request).await?;
+                        let error = record_error_and_rollback(connection, &query_metrics, returned_rows, error).await;
                         yield DbItem::Error(error);
                     } else {
                         query_metrics.record_success(returned_rows);
                     }
+                  }
                 },
-                ParsedStatement::SetVariable { variable, value} => {
-                    execute_set_variable_query(db_connection, request, variable, value, source_file).await
-                    .with_context(||
-                        format!("Failed to set the {variable} variable to {value:?}")
-                    )?;
+                FileStatement::SetVariable { target, value} => {
+                    execute_set_variable_query(db_connection, request, target, value, source_file).await
+                    .with_context(|| format!("Failed to set variable {}", target.0))
+                    .map_err(|error| with_stmt_position(source_file, value.source_span, error))?;
                 },
-                ParsedStatement::StaticSimpleSet { variable, value} => {
-                    execute_set_simple_static(db_connection, request, variable, value, source_file).await
-                    .with_context(||
-                        format!("Failed to set the {variable} variable to {value:?}")
-                    )?;
-                },
-                ParsedStatement::StaticSimpleSelect { values, query_position } => {
-                    let row = exec_static_simple_select(values, request, db_connection)
-                        .await
-                        .map_err(|e| with_stmt_position(source_file, *query_position, e))?;
-                    for i in parse_dynamic_rows(DbItem::Row(row)) {
-                        yield i;
-                    }
-                }
-                ParsedStatement::Error(e) => yield DbItem::Error(clone_anyhow_err(source_file, e)),
+                FileStatement::Error(e) => yield DbItem::Error(clone_anyhow_err(source_file, e)),
             }
         }
     }
@@ -284,21 +325,20 @@ pub fn stop_at_first_error(
         .take_until(error_rx)
 }
 
-/// Executes the sqlpage pseudo-functions contained in a static simple select
-async fn exec_static_simple_select(
-    columns: &[(String, SimpleSelectValue)],
+async fn execute_single_row(
+    query: &SingleRowQuery,
     req: &ExecutionContext,
     db_connection: &mut DbConn,
 ) -> anyhow::Result<serde_json::Value> {
-    let mut map = serde_json::Map::with_capacity(columns.len());
-    for (name, value) in columns {
-        let value = match value {
-            SimpleSelectValue::Static(s) => s.clone(),
-            SimpleSelectValue::Dynamic(p) => {
-                extract_req_param_as_json(p, req, db_connection).await?
-            }
-        };
-        map = add_value_to_map(map, (name.clone(), value));
+    let mut map = serde_json::Map::with_capacity(query.columns.len());
+    let mut inputs = NoInputs;
+    for column in &query.columns {
+        let value = column
+            .value
+            .evaluate(req, db_connection, &mut inputs)
+            .await?
+            .into_json();
+        map = add_value_to_map(map, (column.name.clone(), value));
     }
     Ok(serde_json::Value::Object(map))
 }
@@ -313,24 +353,10 @@ async fn try_rollback_transaction(db_connection: &mut AnyConnection) {
     }
 }
 
-/// Extracts the value of a parameter from the request.
-/// Returns `Ok(None)` when NULL should be used as the parameter value.
-async fn extract_req_param_as_json(
-    param: &StmtParam,
-    request: &ExecutionContext,
-    db_connection: &mut DbConn,
-) -> anyhow::Result<serde_json::Value> {
-    if let Some(val) = extract_req_param(param, request, db_connection).await? {
-        Ok(serde_json::Value::String(val.into_owned()))
-    } else {
-        Ok(serde_json::Value::Null)
-    }
-}
-
 /// This function is used to create a pinned boxed stream of query results.
 /// This allows recursive calls.
 pub fn stream_query_results_boxed<'a>(
-    sql_file: &'a ParsedSqlFile,
+    sql_file: &'a SqlFile,
     request: &'a ExecutionContext,
     db_connection: &'a mut DbConn,
 ) -> Pin<Box<dyn Stream<Item = DbItem> + 'a>> {
@@ -344,108 +370,167 @@ pub fn stream_query_results_boxed<'a>(
 async fn execute_set_variable_query<'a>(
     db_connection: &'a mut DbConn,
     request: &'a ExecutionContext,
-    variable: &StmtParam,
-    statement: &StmtWithParams,
+    variable: &super::sql::VariableName,
+    statement: &Query,
     source_file: &Path,
 ) -> anyhow::Result<()> {
-    let query = bind_parameters(statement, request, db_connection).await?;
-    let connection = take_connection(&request.app_state.db, db_connection, request).await?;
-    log::debug!(
-        "Executing query to set the {variable:?} variable: {:?}",
-        query.sql
-    );
+    let value = execute_scalar_query(db_connection, request, statement, source_file).await?;
 
-    let db_system_name = request.app_state.db.info.database_type.otel_name();
-    let (query_span, operation_name) = create_db_query_span(
-        query.sql,
-        source_file,
-        statement.query_position.start.line,
-        db_system_name,
-    );
-    let mut query_metrics = DbQueryMetricsContext::new(
-        query_span.clone(),
-        operation_name,
-        db_system_name,
-        &request.app_state.telemetry_metrics,
-    );
-    record_query_params(&query_metrics.span, &query.param_values);
-    let start_time = std::time::Instant::now();
-    let value = match connection
-        .fetch_optional(query)
-        .instrument(query_span.clone())
-        .await
-    {
-        Ok(Some(row)) => {
-            query_metrics.add_duration(start_time.elapsed());
-            query_metrics.record_success(1_i64);
-            row_to_string(&row)
-        }
-        Ok(None) => {
-            query_metrics.add_duration(start_time.elapsed());
-            query_metrics.record_success(0_i64);
-            None
-        }
-        Err(e) => {
-            query_metrics.add_duration(start_time.elapsed());
-            try_rollback_transaction(connection).await;
-            let err = display_stmt_db_error(source_file, statement, e);
-            query_metrics.record_error(0_i64, &err);
-            return Err(err);
-        }
-    };
-
-    let (mut vars, name) = vars_and_name(request, variable)?;
-
-    log::debug!("Setting variable {name} to {value:?}");
-    vars.insert(name.to_owned(), value.map(SingleOrVec::Single));
+    log::debug!("Setting variable {} to {value:?}", variable.0);
+    request
+        .set_variables
+        .borrow_mut()
+        .insert(variable.0.clone(), value.map(SingleOrVec::Single));
 
     Ok(())
 }
 
-async fn execute_set_simple_static<'a>(
+async fn execute_scalar_query<'a>(
     db_connection: &'a mut DbConn,
     request: &'a ExecutionContext,
-    variable: &StmtParam,
-    value: &SimpleSelectValue,
-    _source_file: &Path,
-) -> anyhow::Result<()> {
-    let value_str = match value {
-        SimpleSelectValue::Static(json_value) => match json_value {
-            serde_json::Value::Null => None,
-            serde_json::Value::String(s) => Some(s.clone()),
-            other => Some(other.to_string()),
-        },
-        SimpleSelectValue::Dynamic(stmt_param) => {
-            extract_req_param(stmt_param, request, db_connection)
-                .await?
-                .map(std::borrow::Cow::into_owned)
+    statement: &Query,
+    source_file: &Path,
+) -> anyhow::Result<Option<String>> {
+    let QueryBody::Database(database_query) = &statement.body else {
+        let QueryBody::SingleRow(single_row) = &statement.body else {
+            unreachable!()
+        };
+        ensure_scalar_column_count(single_row.columns.len())?;
+        let row = execute_single_row(single_row, request, db_connection).await?;
+        return scalar_value_from_row(DbItem::Row(row));
+    };
+    let query = bind_query(database_query, request, db_connection).await?;
+    log::debug!("Executing scalar query: {:?}", query.sql);
+    let (query_span, mut query_metrics) =
+        create_query_metrics(request, source_file, statement.source_span, &query);
+
+    let mut scalar_row = None;
+    let mut returned_rows: i64 = 0;
+    let mut error = None;
+    let scalar_subquery_behavior = request
+        .app_state
+        .db
+        .info
+        .database_type
+        .scalar_subquery_behavior();
+    {
+        let connection = take_connection(&request.app_state.db, db_connection, request).await?;
+        let mut stream = connection.fetch_many(query);
+        loop {
+            let start_next = std::time::Instant::now();
+            let next_elem = stream.next().instrument(query_span.clone()).await;
+            query_metrics.add_duration(start_next.elapsed());
+            let Some(elem) = next_elem else { break };
+
+            let result =
+                parse_single_sql_result(source_file, database_query, statement.source_span, elem);
+            let output_column_count = result.output_column_count;
+            match result.item {
+                row @ DbItem::Row(_) => {
+                    returned_rows += 1;
+                    if scalar_row.is_some() {
+                        debug_assert_eq!(
+                            scalar_subquery_behavior,
+                            ScalarSubqueryBehavior::ErrorOnMultipleRows
+                        );
+                        error = Some(anyhow!(
+                            "SET scalar query returned more than one row. A SET subquery must return zero or one row."
+                        ));
+                        break;
+                    }
+                    scalar_row = Some(QueryResult {
+                        item: row,
+                        inputs: result.inputs,
+                        output_column_count,
+                    });
+                    if scalar_subquery_behavior == ScalarSubqueryBehavior::FirstRow {
+                        break;
+                    }
+                }
+                DbItem::FinishedQuery => {}
+                DbItem::Error(err) => {
+                    error = Some(err);
+                    break;
+                }
+            }
         }
+        drop(stream);
+    }
+
+    let value = if let Some(error) = error {
+        let connection = take_connection(&request.app_state.db, db_connection, request).await?;
+        return Err(
+            record_error_and_rollback(connection, &query_metrics, returned_rows, error).await,
+        );
+    } else if let Some(mut row) = scalar_row {
+        ensure_scalar_column_count(row.output_column_count)?;
+        apply_json_columns(&mut row.item, &database_query.json_columns);
+        if let Err(error) = evaluate_computed_columns(
+            request,
+            &database_query.computed_columns,
+            &mut row,
+            db_connection,
+        )
+        .instrument(query_span.clone())
+        .await
+        {
+            let connection = take_connection(&request.app_state.db, db_connection, request).await?;
+            return Err(record_error_and_rollback(
+                connection,
+                &query_metrics,
+                returned_rows,
+                error,
+            )
+            .await);
+        }
+        scalar_value_from_row(row.item)?
+    } else {
+        None
     };
 
-    let (mut vars, name) = vars_and_name(request, variable)?;
-
-    log::debug!("Setting variable {name} to static value {value_str:?}");
-    vars.insert(name.to_owned(), value_str.map(SingleOrVec::Single));
-    Ok(())
+    query_metrics.record_success(returned_rows);
+    Ok(value)
 }
 
-fn vars_and_name<'a, 'b>(
-    request: &'a ExecutionContext,
-    variable: &'b StmtParam,
-) -> anyhow::Result<(std::cell::RefMut<'a, SetVariablesMap>, &'b str)> {
-    match variable {
-        StmtParam::PostOrGet(name) | StmtParam::Get(name) => {
-            if request.post_variables.contains_key(name) {
-                log::warn!(
-                    "Deprecation warning! Setting the value of ${name}, but there is already a form field named :{name}. This will stop working soon. Please rename the variable, or use :{name} directly if you intended to overwrite the posted form field value."
-                );
-            }
-            Ok((request.set_variables.borrow_mut(), name))
-        }
-        StmtParam::Post(name) => Ok((request.set_variables.borrow_mut(), name)),
-        _ => Err(anyhow!(
-            "Only GET and POST variables can be set, not {variable:?}"
-        )),
+async fn record_error_and_rollback(
+    connection: &mut AnyConnection,
+    query_metrics: &DbQueryMetricsContext<'_>,
+    returned_rows: i64,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    query_metrics.record_error(returned_rows, &error);
+    try_rollback_transaction(connection).await;
+    error
+}
+
+fn scalar_value_from_row(item: DbItem) -> anyhow::Result<Option<String>> {
+    let DbItem::Row(Value::Object(row)) = item else {
+        anyhow::bail!("SET scalar query did not return a row object");
+    };
+    ensure_scalar_column_count(row.len())?;
+    Ok(row
+        .into_iter()
+        .next()
+        .and_then(|(_, value)| json_to_scalar_string(value)))
+}
+
+fn ensure_scalar_column_count(column_count: usize) -> anyhow::Result<()> {
+    match column_count {
+        0 => anyhow::bail!(
+            "SET scalar query returned no columns. A SET subquery must select exactly one column."
+        ),
+        1 => Ok(()),
+        _ => anyhow::bail!(
+            "SET scalar query returned more than one column. A SET subquery must select exactly one column."
+        ),
+    }
+}
+
+fn json_to_scalar_string(value: Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => Some(s),
+        other => Some(other.to_string()),
     }
 }
 
@@ -522,23 +607,47 @@ async fn set_trace_context(connection: &mut AnyConnection, db: &Database) {
 #[inline]
 fn parse_single_sql_result(
     source_file: &Path,
-    stmt: &StmtWithParams,
+    query: &DatabaseQuery,
+    source_span: SourceSpan,
     res: sqlx::Result<Either<AnyQueryResult, AnyRow>>,
-) -> DbItem {
+) -> QueryResult {
     match res {
         Ok(Either::Right(r)) => {
             if log::log_enabled!(log::Level::Trace) {
                 debug_row(&r);
             }
-            DbItem::Row(super::sql_to_json::row_to_json(&r))
+            match super::sql_to_json::row_to_json_with_inputs(&r, query.row_input_json.len()) {
+                Ok((row, mut inputs)) => {
+                    decode_json_values(&mut inputs, &query.row_input_json);
+                    QueryResult {
+                        item: DbItem::Row(row),
+                        inputs: RowInputs::new(inputs),
+                        output_column_count: r.columns().len() - query.row_input_json.len()
+                            + query.computed_columns.len(),
+                    }
+                }
+                Err(error) => QueryResult {
+                    item: DbItem::Error(error),
+                    inputs: RowInputs::new(Vec::new()),
+                    output_column_count: 0,
+                },
+            }
         }
         Ok(Either::Left(res)) => {
             log::debug!("Finished query with result: {res:?}");
-            DbItem::FinishedQuery
+            QueryResult {
+                item: DbItem::FinishedQuery,
+                inputs: RowInputs::new(Vec::new()),
+                output_column_count: 0,
+            }
         }
         Err(err) => {
-            let nice_err = display_stmt_db_error(source_file, stmt, err);
-            DbItem::Error(nice_err)
+            let nice_err = display_stmt_db_error(source_file, &query.sql, source_span, err);
+            QueryResult {
+                item: DbItem::Error(nice_err),
+                inputs: RowInputs::new(Vec::new()),
+                output_column_count: 0,
+            }
         }
     }
 }
@@ -564,16 +673,6 @@ fn debug_row(r: &AnyRow) {
 }
 
 fn clone_anyhow_err(source_file: &Path, err: &anyhow::Error) -> anyhow::Error {
-    if let Some(func_err) = err.downcast_ref::<super::sql::SqlPageFunctionError>() {
-        let line = func_err.line;
-        let loc = if line > 0 {
-            format!(":{line}")
-        } else {
-            String::new()
-        };
-        return anyhow::anyhow!("{}{loc} {}", source_file.display(), func_err);
-    }
-
     let mut e = anyhow!(
         "{} contains a syntax error preventing SQLPage from parsing and preparing its SQL statements.",
         source_file.display()
@@ -584,18 +683,22 @@ fn clone_anyhow_err(source_file: &Path, err: &anyhow::Error) -> anyhow::Error {
     e
 }
 
-async fn bind_parameters<'a>(
-    stmt: &'a StmtWithParams,
+async fn bind_query<'a>(
+    query: &'a DatabaseQuery,
     request: &'a ExecutionContext,
     db_connection: &mut DbConn,
-) -> anyhow::Result<StatementWithParams<'a>> {
-    let sql = stmt.query.as_str();
+) -> anyhow::Result<BoundQuery<'a>> {
+    let sql = query.sql.as_str();
     log::debug!("Preparing statement: {sql}");
     let mut arguments = AnyArguments::default();
-    let mut param_values = Vec::with_capacity(stmt.params.len());
-    for (param_idx, param) in stmt.params.iter().enumerate() {
-        log::trace!("\tevaluating parameter {}: {}", param_idx + 1, param);
-        let argument = extract_req_param(param, request, db_connection).await?;
+    let mut param_values = Vec::with_capacity(query.bindings.len());
+    let mut inputs = NoInputs;
+    for (param_idx, binding) in query.bindings.iter().enumerate() {
+        log::trace!("\tevaluating binding {}: {:?}", param_idx + 1, binding);
+        let argument = binding
+            .evaluate(request, db_connection, &mut inputs)
+            .await?
+            .into_function_argument();
         log::debug!(
             "\tparameter {}: {}",
             param_idx + 1,
@@ -608,8 +711,8 @@ async fn bind_parameters<'a>(
             Some(Cow::Borrowed(v)) => arguments.add(v),
         }
     }
-    let has_arguments = !stmt.params.is_empty();
-    Ok(StatementWithParams {
+    let has_arguments = !query.bindings.is_empty();
+    Ok(BoundQuery {
         sql,
         arguments,
         has_arguments,
@@ -617,57 +720,24 @@ async fn bind_parameters<'a>(
     })
 }
 
-async fn apply_delayed_functions(
+async fn evaluate_computed_columns(
     request: &ExecutionContext,
-    delayed_functions: &[DelayedFunctionCall],
-    item: &mut DbItem,
+    columns: &[OutputColumn<RowExpr>],
+    result: &mut QueryResult,
+    db_connection: &mut DbConn,
 ) -> anyhow::Result<()> {
-    // We need to open new connections for each delayed function call, because we are still fetching the results of the current query in the main connection.
-    let mut db_conn = None;
-    if let DbItem::Row(serde_json::Value::Object(results)) = item {
-        for f in delayed_functions {
-            log::trace!("Applying delayed function {} to {:?}", f.function, results);
-            apply_single_delayed_function(request, &mut db_conn, f, results).await?;
-            log::trace!(
-                "Delayed function applied {}. Result: {:?}",
-                f.function,
-                results
-            );
+    if let DbItem::Row(serde_json::Value::Object(results)) = &mut result.item {
+        for column in columns {
+            let value = column
+                .value
+                .evaluate(request, db_connection, &mut result.inputs)
+                .await?
+                .into_json();
+            let old_results = std::mem::take(results);
+            *results = add_value_to_map(old_results, (column.name.clone(), value));
         }
     }
     Ok(())
-}
-
-async fn apply_single_delayed_function(
-    request: &ExecutionContext,
-    db_connection: &mut DbConn,
-    f: &DelayedFunctionCall,
-    row: &mut serde_json::Map<String, serde_json::Value>,
-) -> anyhow::Result<()> {
-    let mut params = Vec::new();
-    for arg in &f.argument_col_names {
-        let Some(arg_value) = row.remove(arg) else {
-            anyhow::bail!(
-                "The column {arg} is missing in the result set, but it is required by the {} function.",
-                f.function
-            );
-        };
-        params.push(json_to_fn_param(arg_value));
-    }
-    let result_str = f.function.evaluate(request, db_connection, params).await?;
-    let result_json = result_str
-        .map(Cow::into_owned)
-        .map_or(serde_json::Value::Null, serde_json::Value::String);
-    row.insert(f.target_col_name.clone(), result_json);
-    Ok(())
-}
-
-fn json_to_fn_param(json: serde_json::Value) -> Option<Cow<'static, str>> {
-    match json {
-        serde_json::Value::String(s) => Some(Cow::Owned(s)),
-        serde_json::Value::Null => None,
-        _ => Some(Cow::Owned(json.to_string())),
-    }
 }
 
 fn apply_json_columns(item: &mut DbItem, json_columns: &[String]) {
@@ -700,14 +770,27 @@ fn apply_json_columns(item: &mut DbItem, json_columns: &[String]) {
     }
 }
 
-pub struct StatementWithParams<'a> {
+fn decode_json_values(values: &mut [Value], json_flags: &[bool]) {
+    debug_assert_eq!(values.len(), json_flags.len());
+    for (value, decode_as_json) in values.iter_mut().zip(json_flags) {
+        if *decode_as_json
+            && let Value::String(json) = value
+            && let Ok(parsed) = serde_json::from_str(json)
+        {
+            *value = parsed;
+        }
+    }
+}
+
+/// Rewritten SQL and evaluated arguments in the form consumed by `sqlx`.
+pub struct BoundQuery<'a> {
     sql: &'a str,
     arguments: AnyArguments<'a>,
     has_arguments: bool,
     param_values: Vec<Option<String>>,
 }
 
-impl<'q> sqlx::Execute<'q, Any> for StatementWithParams<'q> {
+impl<'q> sqlx::Execute<'q, Any> for BoundQuery<'q> {
     fn sql(&self) -> &'q str {
         self.sql
     }

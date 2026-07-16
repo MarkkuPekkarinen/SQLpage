@@ -1,3 +1,20 @@
+//! Runtime codec from heterogeneous `sqlx::Any` rows to `SQLPage`'s JSON rows.
+//!
+//! Once a rewritten query returns data, this module decodes each physical SQL
+//! value according to its driver-reported type and normalizes it into a
+//! [`serde_json::Value`]. Public columns are collected into an object, duplicate
+//! names become arrays, ODBC-folded identifiers are canonicalized where needed,
+//! and database-specific numeric, temporal, JSON, binary, UUID, and range types
+//! receive stable JSON-compatible representations.
+//!
+//! Rewritten queries may append private columns that carry database values into
+//! SQLPage-computed projections. [`row_to_json_with_inputs`] splits that trailing
+//! suffix by ordinal, not alias, so generated names cannot collide with user
+//! columns; it returns the private values separately from the visible row after
+//! decoding every physical value once. `execute_queries` then applies the
+//! rewrite's JSON metadata and evaluates computed expressions. This module only
+//! owns physical row decoding and does not decide where expressions execute.
+
 use crate::utils::add_value_to_map;
 use crate::webserver::database::blob_to_data_url;
 use bigdecimal::BigDecimal;
@@ -9,6 +26,7 @@ use sqlx::postgres::types::PgRange;
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 use sqlx::{Decode, Type};
 
+#[cfg(test)]
 pub fn row_to_json(row: &AnyRow) -> Value {
     use Value::Object;
 
@@ -20,6 +38,32 @@ pub fn row_to_json(row: &AnyRow) -> Value {
         map = add_value_to_map(map, (key, value));
     }
     Object(map)
+}
+
+/// Decodes a row into user-visible columns and a private trailing input suffix.
+///
+/// Every SQL value is decoded exactly once. Private values are addressed by
+/// ordinal, so their generated SQL aliases cannot collide with user columns.
+pub fn row_to_json_with_inputs(
+    row: &AnyRow,
+    input_count: usize,
+) -> anyhow::Result<(Value, Vec<Value>)> {
+    let columns = row.columns();
+    let public_count = columns
+        .len()
+        .checked_sub(input_count)
+        .ok_or_else(|| anyhow::anyhow!("The query returned fewer columns than SQLPage expected"))?;
+    let mut map = Map::new();
+    let mut inputs = Vec::with_capacity(input_count);
+    for column in &columns[..public_count] {
+        let key = canonical_col_name(column);
+        let value = sql_to_json(row, column);
+        map = add_value_to_map(map, (key, value));
+    }
+    for column in &columns[public_count..] {
+        inputs.push(sql_to_json(row, column));
+    }
+    Ok((Value::Object(map), inputs))
 }
 
 fn canonical_col_name(col: &AnyColumn) -> String {
@@ -156,16 +200,6 @@ pub fn sql_nonnull_to_json<'r>(mut get_ref: impl FnMut() -> sqlx::any::AnyValueR
     }
 }
 
-/// Takes the first column of a row and converts it to a string.
-pub fn row_to_string(row: &AnyRow) -> Option<String> {
-    let col = row.columns().first()?;
-    match sql_to_json(row, col) {
-        serde_json::Value::String(s) => Some(s),
-        serde_json::Value::Null => None,
-        other => Some(other.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::app_config::tests::test_database_url;
@@ -213,6 +247,24 @@ mod tests {
                 "three_values": ["x","y","z"],
             }),
         );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn private_inputs_are_split_from_the_trailing_suffix() -> anyhow::Result<()> {
+        let db_url = test_database_url();
+        let mut connection = sqlx::AnyConnection::connect(&db_url).await?;
+        let row = sqlx::query(
+            "SELECT 'public' AS \"__sqlpage_input_0\", 'private' AS \"__sqlpage_input_0\"",
+        )
+        .fetch_one(&mut connection)
+        .await?;
+        let (public, inputs) = row_to_json_with_inputs(&row, 1)?;
+        expect_json_object_equal(
+            &public,
+            &serde_json::json!({ "__sqlpage_input_0": "public" }),
+        );
+        assert_eq!(inputs, [serde_json::json!("private")]);
         Ok(())
     }
 

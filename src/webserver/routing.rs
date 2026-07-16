@@ -77,7 +77,7 @@
 //! ```
 
 use crate::filesystem::{FileAccess, FileSystem};
-use crate::webserver::database::ParsedSqlFile;
+use crate::webserver::database::SqlFile;
 use crate::{AppState, file_cache::FileCache};
 use RoutingAction::{CustomNotFound, Execute, NotFound, Redirect, Serve};
 use awc::http::uri::PathAndQuery;
@@ -109,14 +109,14 @@ pub trait RoutingConfig {
 }
 
 pub(crate) struct AppFileStore<'a> {
-    cache: &'a FileCache<ParsedSqlFile>,
+    cache: &'a FileCache<SqlFile>,
     filesystem: &'a FileSystem,
     app_state: &'a AppState,
 }
 
 impl<'a> AppFileStore<'a> {
     pub fn new(
-        cache: &'a FileCache<ParsedSqlFile>,
+        cache: &'a FileCache<SqlFile>,
         filesystem: &'a FileSystem,
         app_state: &'a AppState,
     ) -> Self {

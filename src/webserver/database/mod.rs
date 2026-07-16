@@ -4,14 +4,13 @@ mod csv_import;
 pub mod execute_queries;
 pub mod migrations;
 mod sql;
+mod sqlpage_expr;
 mod sqlpage_functions;
-mod syntax_tree;
 
 mod error_highlighting;
 mod sql_to_json;
 
-pub use sql::ParsedSqlFile;
-use sql::{DB_PLACEHOLDERS, DbPlaceHolder};
+pub use sql::SqlFile;
 use sqlx::any::AnyKind;
 // SupportedDatabase is defined in this module
 
@@ -26,6 +25,12 @@ pub enum SupportedDatabase {
     Mssql,
     Snowflake,
     Generic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarSubqueryBehavior {
+    FirstRow,
+    ErrorOnMultipleRows,
 }
 
 impl SupportedDatabase {
@@ -77,6 +82,32 @@ impl SupportedDatabase {
             Self::Mssql => "microsoft.sql_server",
             Self::Snowflake => "snowflake",
             Self::Generic => "other_sql",
+        }
+    }
+
+    /// Mirrors how the backend handles a scalar subquery that returns multiple rows.
+    fn scalar_subquery_behavior(self) -> ScalarSubqueryBehavior {
+        match self {
+            Self::Sqlite => ScalarSubqueryBehavior::FirstRow,
+            _ => ScalarSubqueryBehavior::ErrorOnMultipleRows,
+        }
+    }
+
+    fn concat_function_null_behavior(self) -> sqlpage_expr::ConcatNullBehavior {
+        use sqlpage_expr::ConcatNullBehavior::{IgnoreNull, PropagateNull};
+
+        match self {
+            Self::Sqlite | Self::Duckdb | Self::Oracle | Self::Postgres | Self::Mssql => IgnoreNull,
+            Self::MySql | Self::Snowflake | Self::Generic => PropagateNull,
+        }
+    }
+
+    fn concat_operator_null_behavior(self) -> sqlpage_expr::ConcatNullBehavior {
+        use sqlpage_expr::ConcatNullBehavior::{IgnoreNull, PropagateNull};
+
+        match self {
+            Self::Oracle | Self::Mssql => IgnoreNull,
+            _ => PropagateNull,
         }
     }
 }
@@ -131,12 +162,75 @@ impl std::fmt::Display for Database {
 #[inline]
 #[must_use]
 pub fn make_placeholder(dbms: AnyKind, arg_number: usize) -> String {
-    if let Some((_, placeholder)) = DB_PLACEHOLDERS.iter().find(|(kind, _)| *kind == dbms) {
-        match *placeholder {
-            DbPlaceHolder::PrefixedNumber { prefix } => format!("{prefix}{arg_number}"),
-            DbPlaceHolder::Positional { placeholder } => placeholder.to_string(),
+    match dbms {
+        AnyKind::Sqlite => format!("?{arg_number}"),
+        AnyKind::Postgres => format!("${arg_number}"),
+        AnyKind::Mssql => format!("@p{arg_number}"),
+        AnyKind::MySql | AnyKind::Odbc => "?".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sqlpage_expr::ConcatNullBehavior::{IgnoreNull, PropagateNull};
+    use super::{ScalarSubqueryBehavior, SupportedDatabase};
+
+    #[test]
+    fn scalar_subquery_behavior_matches_backends() {
+        assert_eq!(
+            SupportedDatabase::Sqlite.scalar_subquery_behavior(),
+            ScalarSubqueryBehavior::FirstRow
+        );
+        for database in [
+            SupportedDatabase::Duckdb,
+            SupportedDatabase::Oracle,
+            SupportedDatabase::Postgres,
+            SupportedDatabase::MySql,
+            SupportedDatabase::Mssql,
+            SupportedDatabase::Snowflake,
+            SupportedDatabase::Generic,
+        ] {
+            assert_eq!(
+                database.scalar_subquery_behavior(),
+                ScalarSubqueryBehavior::ErrorOnMultipleRows
+            );
         }
-    } else {
-        unreachable!("missing dbms: {dbms:?} in DB_PLACEHOLDERS ({DB_PLACEHOLDERS:?})")
+    }
+
+    #[test]
+    fn concat_null_behavior_matches_backends() {
+        for database in [
+            SupportedDatabase::Sqlite,
+            SupportedDatabase::Duckdb,
+            SupportedDatabase::Oracle,
+            SupportedDatabase::Postgres,
+            SupportedDatabase::Mssql,
+        ] {
+            assert_eq!(database.concat_function_null_behavior(), IgnoreNull);
+        }
+        for database in [
+            SupportedDatabase::MySql,
+            SupportedDatabase::Snowflake,
+            SupportedDatabase::Generic,
+        ] {
+            assert_eq!(database.concat_function_null_behavior(), PropagateNull);
+        }
+    }
+
+    #[test]
+    fn concat_operator_null_behavior_matches_backends() {
+        for database in [SupportedDatabase::Oracle, SupportedDatabase::Mssql] {
+            assert_eq!(database.concat_operator_null_behavior(), IgnoreNull);
+        }
+        for database in [
+            SupportedDatabase::Sqlite,
+            SupportedDatabase::Duckdb,
+            SupportedDatabase::Postgres,
+            SupportedDatabase::MySql,
+            SupportedDatabase::Snowflake,
+            SupportedDatabase::Generic,
+        ] {
+            assert_eq!(database.concat_operator_null_behavior(), PropagateNull);
+        }
     }
 }
