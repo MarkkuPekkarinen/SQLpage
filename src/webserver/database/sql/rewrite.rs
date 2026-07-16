@@ -1,4 +1,22 @@
-//! Rewrites parsed SQL into database SQL and SQLPage-owned expressions.
+//! Compiler pass that partitions parsed SQL between the database and `SQLPage`.
+//!
+//! `SQLPage` files contain expressions owned by two runtimes: the configured
+//! database handles ordinary SQL, while variables and `sqlpage.*` functions are
+//! evaluated by `SQLPage`. This module makes that boundary explicit. Values
+//! needed before a database statement become typed bindings; computed
+//! projections run once per returned row, with any database-owned dependencies
+//! appended to the SQL projection as a private trailing column suffix. Queries
+//! that require no database work become single-row `SQLPage` plans instead. The
+//! distinct standalone and row expression types prevent pre-query work from
+//! depending on a row that does not exist yet.
+//!
+//! Rewriting also renders backend-appropriate placeholders and casts, preserves
+//! selected DBMS semantics for operations `SQLPage` emulates, records which
+//! returned values need JSON decoding, and rejects grouping, ordering, or other
+//! relational clauses that would incorrectly depend on post-database computed
+//! columns. Its output is the immutable query representation consumed by
+//! `execute_queries`; no request values are resolved and no functions are
+//! executed here.
 
 use std::ops::ControlFlow;
 use std::str::FromStr as _;

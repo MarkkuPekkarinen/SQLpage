@@ -1,3 +1,20 @@
+//! Runtime codec from heterogeneous `sqlx::Any` rows to `SQLPage`'s JSON rows.
+//!
+//! Once a rewritten query returns data, this module decodes each physical SQL
+//! value according to its driver-reported type and normalizes it into a
+//! [`serde_json::Value`]. Public columns are collected into an object, duplicate
+//! names become arrays, ODBC-folded identifiers are canonicalized where needed,
+//! and database-specific numeric, temporal, JSON, binary, UUID, and range types
+//! receive stable JSON-compatible representations.
+//!
+//! Rewritten queries may append private columns that carry database values into
+//! SQLPage-computed projections. [`row_to_json_with_inputs`] splits that trailing
+//! suffix by ordinal, not alias, so generated names cannot collide with user
+//! columns; it returns the private values separately from the visible row after
+//! decoding every physical value once. `execute_queries` then applies the
+//! rewrite's JSON metadata and evaluates computed expressions. This module only
+//! owns physical row decoding and does not decide where expressions execute.
+
 use crate::utils::add_value_to_map;
 use crate::webserver::database::blob_to_data_url;
 use bigdecimal::BigDecimal;

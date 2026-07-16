@@ -1,3 +1,20 @@
+//! SQL-file front end that turns source text into a cacheable execution plan.
+//!
+//! A routed `.sql` file reaches this module before request-specific values are
+//! available. It selects the connected DBMS's parser dialect, tokenizes and
+//! parses statements with source locations, and classifies each statement as a
+//! query, `SQLPage` `SET` assignment, CSV import, or error. Parse and rewrite
+//! errors are retained as statements so they can flow through `SQLPage`'s normal
+//! execution and rendering error path, while the resulting [`SqlFile`] remains
+//! request-independent and safe to reuse from the file cache.
+//!
+//! Ordinary statements and `SET` value queries are delegated to [`rewrite`],
+//! which lowers the parsed AST into database SQL plus SQLPage-owned expressions.
+//! The immutable statement types live in [`statement`]; `execute_queries` later
+//! supplies request variables, runs the database work, and evaluates the
+//! `SQLPage` expressions. This module therefore owns parsing and statement
+//! classification, but not query execution or database-row decoding.
+
 use std::fmt::Write as _;
 use std::path::Path;
 
