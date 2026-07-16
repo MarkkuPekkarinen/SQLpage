@@ -143,7 +143,11 @@ fn assert_json_test(body: &str, test_file: &std::path::Path) {
         };
 
         if let Some(err) = format_error(obj) {
-            panic!("\n{}: response contains an error:\n\n{}", test_file.display(), err);
+            panic!(
+                "\n{}: response contains an error:\n\n{}",
+                test_file.display(),
+                err
+            );
         }
 
         let actual = obj
