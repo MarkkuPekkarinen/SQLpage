@@ -2,11 +2,36 @@
 
 ## unreleased
 
-- **SQLPage function evaluation is now lazier.** A `sqlpage.*` call that is the whole value of a selected column now runs after the database query, once for each returned row. If the query returns no rows, the function is not called. Other SQLPage function calls still run before the query when their arguments do not depend on database columns. `SET x = (SELECT ...)` now has explicit scalar-query semantics: zero rows set `x` to `NULL`, one row with one column sets the value, multiple columns return a clear SQLPage error, and multiple rows follow the database's scalar-subquery behavior. Migration notes:
-  -  `SELECT sqlpage.fetch('https://api.example.com') AS body FROM many_rows` will now make one HTTP request per row; use `SET body = sqlpage.fetch(...)` first for one request per page.
-  - `SELECT sqlpage.exec('command') AS result FROM many_rows` will now run once per row; use `SET` first for once-per-page execution
-  - `SELECT sqlpage.random_string(8) AS token FROM many_rows` now produces one token per row instead of one token reused across rows
-  - `SET result = (SELECT sqlpage.fetch($url) WHERE NOT $cached)` now works as expected and does not re-fetch a cached result. Apps relying on sqlite-specific `SET x = (SELECT y FROM t)` first-row behavior should add `LIMIT 1` and select exactly one column.
+- **SQLPage functions can now be composed with database results.** Direct calls such as `SELECT sqlpage.url_encode(url) FROM links` already ran once per row. Per-row evaluation now also works through parentheses, concatenation, `COALESCE`, JSON constructors, and nested SQLPage functions. The database first decides which rows exist, then SQLPage evaluates the selected expression for each row. This enables patterns that were not previously possible, such as fetching only missing cached values or rendering a reusable SQL file with parameters from each row:
+
+  ```sql
+  SELECT
+      id,
+      COALESCE(cached_response, sqlpage.fetch(api_url)) AS response
+  FROM integrations;
+
+  SELECT
+      'dynamic' AS component,
+      sqlpage.run_sql('item.sql', json_object('id', id)) AS properties
+  FROM items;
+  ```
+
+  `COALESCE` is evaluated from left to right, so the first query only calls the API for rows where `cached_response` is `NULL`. If a query returns no rows, none of its selected SQLPage functions run. This also makes database-controlled conditional work possible with scalar `SET` queries:
+
+  ```sql
+  SET refresh_result = (
+      SELECT sqlpage.fetch(refresh_url)
+      FROM cache_entries
+      WHERE cache_key = $key AND expires_at < CURRENT_TIMESTAMP
+  );
+  ```
+
+  **Upgrade notes:**
+  - A `sqlpage.*` call with only constants or request variables that is the whole value of a selected column now also runs once per returned row. For example, `SELECT id, sqlpage.fetch($url) AS body FROM jobs` previously made one HTTP request and reused its result; it now makes one request per job. The same applies to side-effecting or expensive functions such as `sqlpage.exec`, `sqlpage.run_sql`, and `sqlpage.persist_uploaded_file`. To run a function once per page, store its result first: `SET body = sqlpage.fetch($url);`, then select `$body`.
+  - `SELECT id, sqlpage.random_string(8) AS token FROM invitations` now creates a different token for every invitation instead of repeating one token. If one shared batch token is intended, use `SET token = sqlpage.random_string(8);` first.
+  - A selected function is no longer called when its query returns no rows. Move the call to a separate `SET` statement if it must run unconditionally.
+  - SQLPage-computed values do not exist yet when the database performs `DISTINCT`, filtering, grouping, or sorting. Queries that use `SELECT DISTINCT` with a computed projection, reference a computed alias from `WHERE`, `GROUP BY`, or `ORDER BY`, or use ordinal `GROUP BY`/`ORDER BY` with a computed projection now return a clear error instead of producing database-dependent results. Apply those operations to the source database columns, or compute the value once with `SET` when it does not depend on a row.
+  - `SET x = (SELECT ...)` now has explicit scalar-query behavior: zero rows set `x` to `NULL`, exactly one output column is required, and multiple columns return a clear SQLPage error. Multiple rows keep the database's scalar-subquery behavior: SQLite uses the first row, while other supported databases return an error. For portable results, make the query intrinsically single-row with a unique predicate or aggregate, or use the database's one-row limiter.
 - **Access logs now go to stdout.** SQLPage now writes the single per-request completion log line to stdout with the target `sqlpage::access`, matching common application-server and container logging conventions. Diagnostic logs, warnings, and internal errors still go to stderr. If your `LOG_LEVEL` or `RUST_LOG` filter is scoped to a specific old target such as `sqlpage::webserver::http=info`, add `sqlpage::access=info` so request-completion logs are still emitted. If your log pipeline only collects stderr, update it to collect stdout too.
 - **OIDC redirects are no longer cacheable.** Authorization redirects contain one-time state and post-login redirects set session cookies. SQLPage now sends `Cache-Control: no-store` for these responses, preventing a browser or intermediary from replaying an expired authorization redirect.
 
