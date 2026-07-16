@@ -121,21 +121,9 @@ async fn run_sql_test(
 }
 
 fn format_error(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
-    if obj.get("component").and_then(|v| v.as_str()) != Some("error") {
-        return None;
-    }
-    let mut msg = String::new();
-    if let Some(desc) = obj.get("description").and_then(|v| v.as_str()) {
-        msg.push_str(desc);
-    }
-    if let Some(bt) = obj.get("backtrace").and_then(|v| v.as_array()) {
-        for frame in bt {
-            if let Some(s) = frame.as_str() {
-                msg.push_str(&format!("\n  {}", s));
-            }
-        }
-    }
-    Some(msg)
+    obj.get("error")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
 }
 
 fn assert_json_test(body: &str, test_file: &std::path::Path) {
@@ -155,7 +143,7 @@ fn assert_json_test(body: &str, test_file: &std::path::Path) {
         };
 
         if let Some(err) = format_error(obj) {
-            panic!("Error in {}:\n{}", test_file.display(), err);
+            panic!("\n{}: response contains an error:\n\n{}", test_file.display(), err);
         }
 
         let actual = obj
@@ -182,7 +170,7 @@ fn assert_json_test(body: &str, test_file: &std::path::Path) {
 
         if expected.is_empty() && expected_contains.is_empty() {
             panic!(
-                "No expected values found in {}: {}",
+                "{}: No `expected` column returned: \n{:#}",
                 test_file.display(),
                 row
             );
