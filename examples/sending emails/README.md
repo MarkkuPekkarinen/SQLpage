@@ -5,8 +5,10 @@ This example sends plain-text email with [`sqlpage.send_mail`](https://sql-page.
 Run the example:
 
 ```sh
-docker compose up
+docker compose up --build
 ```
+
+This builds SQLPage from the current repository checkout before starting the example.
 
 Open http://localhost:8080 and choose one of two flows, then inspect the message in the Mailpit inbox at http://localhost:8025:
 
