@@ -38,6 +38,8 @@ pub mod http_client;
 pub mod http_metrics;
 pub mod http_request_info;
 mod https;
+#[cfg(feature = "lambda-web")]
+mod lambda_http;
 pub mod request_variables;
 pub mod server_timing;
 

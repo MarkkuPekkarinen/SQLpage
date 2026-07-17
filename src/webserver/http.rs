@@ -625,8 +625,8 @@ pub async fn run_server(config: &AppConfig, state: AppState) -> anyhow::Result<(
     let factory = move || create_app(web::Data::clone(&state));
 
     #[cfg(feature = "lambda-web")]
-    if lambda_web::is_running_on_lambda() {
-        lambda_web::run_actix_on_lambda(factory)
+    if super::lambda_http::is_running_on_lambda() {
+        super::lambda_http::run(factory)
             .await
             .map_err(|e| anyhow::anyhow!("Unable to start the lambda: {e}"))?;
         return Ok(());
