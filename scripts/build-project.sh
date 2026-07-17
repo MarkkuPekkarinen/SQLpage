@@ -4,6 +4,10 @@ set -euo pipefail
 source /tmp/build-env.sh
 
 PROFILE="${CARGO_PROFILE:-superoptimized}"
+OUTPUT_DIR="$PROFILE"
+if [ "$PROFILE" = "dev" ]; then
+    OUTPUT_DIR="debug"
+fi
 echo "Building project for target: $TARGET (profile: $PROFILE)"
 
 cargo build \
@@ -12,4 +16,4 @@ cargo build \
     --features odbc-static \
     --profile "$PROFILE"
 
-mv "target/$TARGET/$PROFILE/sqlpage" sqlpage.bin
+mv "target/$TARGET/$OUTPUT_DIR/sqlpage" sqlpage.bin
