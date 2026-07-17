@@ -1,10 +1,11 @@
 set message = json_object(
     'to', :recipient,
-    'from', :sender,
     'subject', :subject,
     'body', :body
 );
 set result = sqlpage.send_mail($message);
+
+select 'shell' as component, 'Simple email result' as title;
 
 select
     'alert' as component,
@@ -13,4 +14,5 @@ select
     json_extract($result, '$.error') as description;
 
 select 'button' as component;
-select 'Send another email' as title, 'index.sql' as link;
+select 'Send another simple email' as title, 'simple.sql' as link;
+select 'Back to examples' as title, 'index.sql' as link, 'secondary' as color;

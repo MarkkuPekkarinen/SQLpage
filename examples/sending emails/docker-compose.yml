@@ -7,6 +7,7 @@ services:
       SMTP_HOST: mailpit
       SMTP_PORT: 1025
       SMTP_TLS_MODE: none
+      SMTP_FROM: SQLPage Demo <sqlpage@example.com>
     volumes:
       - .:/var/www
     depends_on:

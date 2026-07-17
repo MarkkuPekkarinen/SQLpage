@@ -1,10 +1,15 @@
-select
-    'form' as component,
-    'Send an email through SMTP' as title,
-    'email.sql' as action,
-    'post' as method;
+select 'shell' as component, 'Sending emails with SQLPage' as title;
 
-select 'recipient' as name, 'To' as label, 'recipient@example.com' as value, true as required;
-select 'sender' as name, 'From' as label, 'SQLPage <sqlpage@example.com>' as value, true as required;
-select 'subject' as name, 'Subject' as label, 'Test email' as value, true as required;
-select 'textarea' as type, 'body' as name, 'Message' as label, 'This is a test email' as value, true as required;
+select
+    'text' as component,
+    'Choose a focused example. Both send through the SMTP server configured for SQLPage.' as contents;
+
+select 'card' as component, 2 as columns;
+select
+    'Simple email' as title,
+    'Send a plain-text message using the configured default sender.' as description,
+    'simple.sql' as link;
+select
+    'Advanced email' as title,
+    'Add multiple recipients, Cc, Reply-To, a sender override, and an uploaded attachment.' as description,
+    'advanced.sql' as link;
