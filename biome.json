@@ -3,8 +3,9 @@
   "files": {
     "includes": [
       "**",
-      "!examples/official-site/pgconf/**",
-      "!tests/end-to-end/test-results/**",
+      "!**/*.svg",
+      "!examples/official-site/pgconf",
+      "!tests/end-to-end/test-results",
       "!.zed/*.json"
     ],
     "ignoreUnknown": true
