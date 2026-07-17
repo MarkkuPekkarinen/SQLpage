@@ -2,6 +2,7 @@
 
 ## v0.45
 
+- **Configuration loading now includes only the documented JSON, JSON5, TOML, and YAML formats.** The `config` dependency previously enabled its default INI and RON parsers even though SQLPage never documented those formats. Undocumented `.ini` and `.ron` configuration files are no longer loaded; migrate them to a supported format before upgrading.
 - **SQLPage can now send emails** Configure the relay and optional authentication with `smtp_host`, `smtp_port`, `smtp_username`, `smtp_password`, `smtp_from`, and `smtp_tls_mode`, then call `sqlpage.send_mail` with a JSON message. It returns `{"status":"accepted"}` on SMTP acceptance or `{"status":"error","error_code":"...","error":"..."}` without stopping the request; SQL `NULL` is passed through without sending. Messages support multiple `to` and `cc` recipients, reply-to addresses, and data-URL attachments with a configurable combined decoded-size limit. SMTP passwords are redacted from startup debug logs.
 - **SQLPage functions can now be composed with database results.** Direct calls such as `SELECT sqlpage.url_encode(url) FROM links` already ran once per row. Per-row evaluation now also works through parentheses, concatenation, `COALESCE`, JSON constructors, and nested SQLPage functions. The database first decides which rows exist, then SQLPage evaluates the selected expression for each row. This enables patterns that were not previously possible, such as fetching only missing cached values or rendering a reusable SQL file with parameters from each row:
 

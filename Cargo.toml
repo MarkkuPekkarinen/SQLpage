@@ -67,7 +67,12 @@ async-trait = "0.1.61"
 async-recursion = "1.0.0"
 bigdecimal = { version = "0.4.8", features = ["serde-json"] }
 include_dir = "0.7.2"
-config = { version = "0.15.4", features = ["json"] }
+config = { version = "0.15.4", default-features = false, features = [
+    "json",
+    "json5",
+    "toml",
+    "yaml",
+] }
 markdown = { version = "1", features = ["log"] }
 argon2 = "0.5.3"
 actix-web-httpauth = "0.8.0"
