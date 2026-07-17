@@ -57,11 +57,24 @@ async fn test_routing_with_db_fs() {
         return;
     }
 
-    let drop_sql = "DROP TABLE IF EXISTS sqlpage_files";
-    state.db.connection.execute(drop_sql).await.unwrap();
     let create_table_sql =
         sqlpage::filesystem::DbFsQueries::get_create_table_sql(state.db.info.database_type);
-    state.db.connection.execute(create_table_sql).await.unwrap();
+    // Other tests share this database, so never drop a table their initialized state may use.
+    if state
+        .db
+        .connection
+        .execute("SELECT 1 FROM sqlpage_files WHERE 1 = 0")
+        .await
+        .is_err()
+    {
+        state.db.connection.execute(create_table_sql).await.unwrap();
+    }
+    state
+        .db
+        .connection
+        .execute("DELETE FROM sqlpage_files WHERE path = 'on_db.sql'")
+        .await
+        .unwrap();
     let insert_sql = format!(
         "INSERT INTO sqlpage_files(path, contents) VALUES ('on_db.sql', {})",
         make_placeholder(state.db.info.kind, 1)

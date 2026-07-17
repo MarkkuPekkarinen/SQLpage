@@ -29,6 +29,10 @@ select
 from categories;
 ```
 
+When `sqlpage.set_variable(...)` is used as a standalone selected column in a query that returns several rows, it runs once per returned row.
+This is useful for generating one link per row, as in the example above.
+If you need a single link reused later in the page, store it with `SET` first.
+
 ### Parameters
  - `name` (TEXT): The name of the variable to set.
  - `value` (TEXT): The value to set the variable to. If `NULL` is passed, the variable is removed from the URL.

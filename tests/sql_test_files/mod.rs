@@ -121,21 +121,9 @@ async fn run_sql_test(
 }
 
 fn format_error(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
-    if obj.get("component").and_then(|v| v.as_str()) != Some("error") {
-        return None;
-    }
-    let mut msg = String::new();
-    if let Some(desc) = obj.get("description").and_then(|v| v.as_str()) {
-        msg.push_str(desc);
-    }
-    if let Some(bt) = obj.get("backtrace").and_then(|v| v.as_array()) {
-        for frame in bt {
-            if let Some(s) = frame.as_str() {
-                msg.push_str(&format!("\n  {}", s));
-            }
-        }
-    }
-    Some(msg)
+    obj.get("error")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
 }
 
 fn assert_json_test(body: &str, test_file: &std::path::Path) {
@@ -155,7 +143,11 @@ fn assert_json_test(body: &str, test_file: &std::path::Path) {
         };
 
         if let Some(err) = format_error(obj) {
-            panic!("Error in {}:\n{}", test_file.display(), err);
+            panic!(
+                "\n{}: response contains an error:\n\n{}",
+                test_file.display(),
+                err
+            );
         }
 
         let actual = obj
@@ -182,7 +174,7 @@ fn assert_json_test(body: &str, test_file: &std::path::Path) {
 
         if expected.is_empty() && expected_contains.is_empty() {
             panic!(
-                "No expected values found in {}: {}",
+                "{}: No `expected` column returned: \n{:#}",
                 test_file.display(),
                 row
             );
@@ -218,7 +210,20 @@ fn assert_html_test(body: &str, test_file: &std::path::Path, stem: &str) {
     );
 
     if stem.starts_with("error_") {
-        let expected = stem.strip_prefix("error_").unwrap().replace('_', " ");
+        let mut expected = stem.strip_prefix("error_").unwrap().to_owned();
+        for database in [
+            "sqlite",
+            "duckdb",
+            "oracle",
+            "postgres",
+            "mysql",
+            "mssql",
+            "snowflake",
+            "generic",
+        ] {
+            expected = expected.replace(&format!("_no{database}"), "");
+        }
+        let expected = expected.replace('_', " ");
         assert!(
             body.to_lowercase().contains(&expected.to_lowercase()),
             "Should contain '{}': {}",

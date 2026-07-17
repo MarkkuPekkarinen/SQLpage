@@ -106,6 +106,20 @@ set api_value = sqlpage.fetch($target_url); -- no http request made if the field
 update my_table set field = $api_value where id = 1 and $api_value is not null; -- update the field only if it was not present before
 ```
 
+You can also make the HTTP request depend on whether a database query returns a row.
+When `fetch` is a standalone selected column, SQLPage runs it only for rows returned by the database:
+
+```sql
+set api_value = (
+    select sqlpage.fetch(url)
+    from cache_misses
+    where key = $key
+);
+```
+
+If `cache_misses` has no matching row, no HTTP request is made and `$api_value` is set to `NULL`.
+If the query returns more than one row or more than one column, SQLPage returns a clear scalar `SET` error.
+
 ## Advanced usage
 
 If you need to handle errors or inspect the response headers or the status code,
