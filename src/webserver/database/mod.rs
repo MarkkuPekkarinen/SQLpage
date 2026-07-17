@@ -125,7 +125,7 @@ impl From<AnyKind> for SupportedDatabase {
 }
 
 pub struct Database {
-    pub connection: sqlx::AnyPool,
+    pub connection: sqlx::any::AnyPool,
     pub info: DbInfo,
 }
 

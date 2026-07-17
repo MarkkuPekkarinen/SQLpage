@@ -4624,7 +4624,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sqlparser",
- "sqlx-oldapi",
+ "sqlx-core-oldapi",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -4717,36 +4717,6 @@ dependencies = [
  "uuid",
  "webpki-roots 1.0.8",
  "whoami",
-]
-
-[[package]]
-name = "sqlx-macros-oldapi"
-version = "0.6.56"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adbf4ebc08c19991fa51993f471e572930c4dec146d3dc915a8e54db91d624c6"
-dependencies = [
- "dotenvy",
- "either",
- "heck",
- "once_cell",
- "proc-macro2",
- "quote",
- "serde_json",
- "sha2 0.11.0",
- "sqlx-core-oldapi",
- "sqlx-rt-oldapi",
- "syn",
- "url",
-]
-
-[[package]]
-name = "sqlx-oldapi"
-version = "0.6.56"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9ba4d352504ee1a0a76eb052879d68ba63536c738da5062026ac0d3dc724c7"
-dependencies = [
- "sqlx-core-oldapi",
- "sqlx-macros-oldapi",
 ]
 
 [[package]]

@@ -21,13 +21,19 @@ use crate::webserver::http_request_info::ExecutionContext;
 use crate::webserver::single_or_vec::SingleOrVec;
 
 use super::{Database, DbItem, ScalarSubqueryBehavior, error_highlighting::display_db_error};
-use sqlx::any::{AnyArguments, AnyQueryResult, AnyRow, AnyStatement, AnyTypeInfo};
-use sqlx::pool::PoolConnection;
-use sqlx::{
-    Any, AnyConnection, Arguments, Column, Either, Executor, Row as _, Statement, ValueRef,
+use sqlx::Either;
+use sqlx::any::{
+    Any, AnyArguments, AnyConnection, AnyQueryResult, AnyRow, AnyStatement, AnyTypeInfo,
 };
+use sqlx::arguments::Arguments;
+use sqlx::column::Column;
+use sqlx::executor::{Execute, Executor};
+use sqlx::pool::PoolConnection;
+use sqlx::row::Row as _;
+use sqlx::statement::Statement;
+use sqlx::value::ValueRef;
 
-pub type DbConn = Option<PoolConnection<sqlx::Any>>;
+pub type DbConn = Option<PoolConnection<Any>>;
 
 /// One database result together with private values reserved for computed
 /// columns and therefore omitted from the user-visible row.
@@ -538,7 +544,7 @@ async fn take_connection<'a>(
     db: &'a Database,
     conn: &'a mut DbConn,
     request: &ExecutionContext,
-) -> anyhow::Result<&'a mut PoolConnection<sqlx::Any>> {
+) -> anyhow::Result<&'a mut PoolConnection<Any>> {
     if let Some(c) = conn {
         return Ok(c);
     }
@@ -609,7 +615,7 @@ fn parse_single_sql_result(
     source_file: &Path,
     query: &DatabaseQuery,
     source_span: SourceSpan,
-    res: sqlx::Result<Either<AnyQueryResult, AnyRow>>,
+    res: sqlx::error::Result<Either<AnyQueryResult, AnyRow>>,
 ) -> QueryResult {
     match res {
         Ok(Either::Right(r)) => {
@@ -790,7 +796,7 @@ pub struct BoundQuery<'a> {
     param_values: Vec<Option<String>>,
 }
 
-impl<'q> sqlx::Execute<'q, Any> for BoundQuery<'q> {
+impl<'q> Execute<'q, Any> for BoundQuery<'q> {
     fn sql(&self) -> &'q str {
         self.sql
     }

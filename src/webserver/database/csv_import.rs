@@ -5,10 +5,10 @@ use futures_util::StreamExt;
 use sqlparser::ast::{
     CopyLegacyCsvOption, CopyLegacyOption, CopyOption, CopySource, CopyTarget, Statement,
 };
-use sqlx::{
-    AnyConnection, Arguments, Executor, PgConnection,
-    any::{AnyArguments, AnyConnectionKind, AnyKind},
-};
+use sqlx::any::{AnyArguments, AnyConnection, AnyConnectionKind, AnyKind};
+use sqlx::arguments::Arguments;
+use sqlx::executor::Executor;
+use sqlx::postgres::PgConnection;
 use tokio::io::AsyncRead;
 
 use crate::webserver::http_request_info::RequestInfo;
@@ -337,7 +337,7 @@ fn test_make_statement() {
 
 #[actix_web::test]
 async fn test_end_to_end() {
-    use sqlx::ConnectOptions;
+    use sqlx::connection::ConnectOptions;
 
     let mut copy_stmt = sqlparser::parser::Parser::parse_sql(
         &sqlparser::dialect::GenericDialect {},
@@ -376,7 +376,7 @@ async fn test_end_to_end() {
     run_csv_import_insert(&mut conn, &csv_import, file)
         .await
         .unwrap();
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT * FROM my_table")
+    let rows: Vec<(String, String)> = sqlx::query_as::query_as("SELECT * FROM my_table")
         .fetch_all(&mut conn)
         .await
         .unwrap();

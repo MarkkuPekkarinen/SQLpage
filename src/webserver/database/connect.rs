@@ -8,9 +8,10 @@ use crate::{
 };
 use anyhow::Context;
 use futures_util::future::BoxFuture;
+use sqlx::connection::{ConnectOptions, Connection};
+use sqlx::executor::Executor;
 use sqlx::odbc::OdbcConnectOptions;
 use sqlx::{
-    ConnectOptions, Connection, Executor,
     any::{Any, AnyConnectOptions, AnyConnection, AnyKind},
     pool::PoolOptions,
     sqlite::{Function, SqliteConnectOptions, SqliteFunctionCtx},
@@ -146,11 +147,11 @@ fn add_on_return_to_pool(config: &AppConfig, pool_options: PoolOptions<Any>) -> 
 }
 
 fn on_return_to_pool(
-    conn: &mut sqlx::AnyConnection,
+    conn: &mut sqlx::any::AnyConnection,
     meta: sqlx::pool::PoolConnectionMetadata,
     sql: std::sync::Arc<String>,
-) -> BoxFuture<'_, Result<bool, sqlx::Error>> {
-    use sqlx::Row;
+) -> BoxFuture<'_, Result<bool, sqlx::error::Error>> {
+    use sqlx::row::Row;
     Box::pin(async move {
         log::trace!("Running the custom SQL connection cleanup handler. {meta:?}");
         let query_result = conn.fetch_optional(sql.as_str()).await?;

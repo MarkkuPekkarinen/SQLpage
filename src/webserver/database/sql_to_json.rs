@@ -21,10 +21,14 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use serde_json::{self, Map, Value};
 use sqlx::any::{AnyColumn, AnyRow, AnyTypeInfo, AnyTypeInfoKind};
+use sqlx::column::Column;
+use sqlx::decode::Decode;
 use sqlx::postgres::PgValueRef;
 use sqlx::postgres::types::PgRange;
-use sqlx::{Column, Row, TypeInfo, ValueRef};
-use sqlx::{Decode, Type};
+use sqlx::row::Row;
+use sqlx::type_info::TypeInfo;
+use sqlx::types::Type;
+use sqlx::value::ValueRef;
 
 #[cfg(test)]
 pub fn row_to_json(row: &AnyRow) -> Value {
@@ -118,13 +122,13 @@ fn decode_pg_range<'r, T>(raw_value: sqlx::any::AnyValueRef<'r>) -> Value
 where
     T: std::fmt::Display
         + Type<sqlx::postgres::Postgres>
-        + for<'a> sqlx::Decode<'a, sqlx::postgres::Postgres>,
+        + for<'a> sqlx::decode::Decode<'a, sqlx::postgres::Postgres>,
 {
     let Ok(pg_val): Result<PgValueRef<'r>, _> = raw_value.try_into() else {
         log::error!("Only postgres range values are supported");
         return Value::Null;
     };
-    match <PgRange<T> as sqlx::Decode<'r, sqlx::postgres::Postgres>>::decode(pg_val) {
+    match <PgRange<T> as sqlx::decode::Decode<'r, sqlx::postgres::Postgres>>::decode(pg_val) {
         Ok(pg_range) => pg_range.to_string().into(),
         Err(e) => {
             log::error!("Failed to decode postgres range value: {e}");
@@ -205,7 +209,7 @@ mod tests {
     use crate::app_config::tests::test_database_url;
 
     use super::*;
-    use sqlx::Connection;
+    use sqlx::connection::Connection;
 
     fn setup_logging() {
         crate::telemetry::init_test_logging();
@@ -224,10 +228,10 @@ mod tests {
 
     #[actix_web::test]
     async fn test_row_to_json() -> anyhow::Result<()> {
-        use sqlx::Connection;
+        use sqlx::connection::Connection;
         let db_url = test_database_url();
-        let mut c = sqlx::AnyConnection::connect(&db_url).await?;
-        let row = sqlx::query(
+        let mut c = sqlx::any::AnyConnection::connect(&db_url).await?;
+        let row = sqlx::query::query(
             "SELECT
                 123.456 as one_value,
                 1 as two_values,
@@ -253,8 +257,8 @@ mod tests {
     #[actix_web::test]
     async fn private_inputs_are_split_from_the_trailing_suffix() -> anyhow::Result<()> {
         let db_url = test_database_url();
-        let mut connection = sqlx::AnyConnection::connect(&db_url).await?;
-        let row = sqlx::query(
+        let mut connection = sqlx::any::AnyConnection::connect(&db_url).await?;
+        let row = sqlx::query::query(
             "SELECT 'public' AS \"__sqlpage_input_0\", 'private' AS \"__sqlpage_input_0\"",
         )
         .fetch_one(&mut connection)
@@ -273,8 +277,8 @@ mod tests {
         let Some(db_url) = db_specific_test("postgres") else {
             return Ok(());
         };
-        let mut c = sqlx::AnyConnection::connect(&db_url).await?;
-        let row = sqlx::query(
+        let mut c = sqlx::any::AnyConnection::connect(&db_url).await?;
+        let row = sqlx::query::query(
             "SELECT
                 42::INT2 as small_int,
                 42::INT4 as integer,
@@ -350,8 +354,8 @@ mod tests {
         let Some(db_url) = db_specific_test("postgres") else {
             return Ok(());
         };
-        let mut c = sqlx::AnyConnection::connect(&db_url).await?;
-        let row = sqlx::query(
+        let mut c = sqlx::any::AnyConnection::connect(&db_url).await?;
+        let row = sqlx::query::query(
             "SELECT
                 '2024-03-14'::DATE as date,
                 '13:14:15'::TIME as time,
@@ -388,8 +392,8 @@ mod tests {
         let Some(db_url) = db_specific_test("postgres") else {
             return Ok(());
         };
-        let mut c = sqlx::AnyConnection::connect(&db_url).await?;
-        let row = sqlx::query(
+        let mut c = sqlx::any::AnyConnection::connect(&db_url).await?;
+        let row = sqlx::query::query(
             "SELECT
                 '[1,5)'::INT4RANGE as int4range,
                 '[2024-11-12 01:02:03,2024-11-12 23:00:00)'::TSRANGE as tsrange,
@@ -419,9 +423,9 @@ mod tests {
         let Some(db_url) = db_url else {
             return Ok(());
         };
-        let mut c = sqlx::AnyConnection::connect(&db_url).await?;
+        let mut c = sqlx::any::AnyConnection::connect(&db_url).await?;
 
-        sqlx::query(
+        sqlx::query::query(
             "CREATE TEMPORARY TABLE _sqlp_t (
                 tiny_int TINYINT,
                 small_int SMALLINT,
@@ -475,7 +479,7 @@ mod tests {
         .execute(&mut c)
         .await?;
 
-        let row = sqlx::query("SELECT * FROM _sqlp_t")
+        let row = sqlx::query::query("SELECT * FROM _sqlp_t")
             .fetch_one(&mut c)
             .await?;
 
@@ -508,7 +512,9 @@ mod tests {
             }),
         );
 
-        sqlx::query("DROP TABLE _sqlp_t").execute(&mut c).await?;
+        sqlx::query::query("DROP TABLE _sqlp_t")
+            .execute(&mut c)
+            .await?;
 
         Ok(())
     }
@@ -518,8 +524,8 @@ mod tests {
         let Some(db_url) = db_specific_test("sqlite") else {
             return Ok(());
         };
-        let mut c = sqlx::AnyConnection::connect(&db_url).await?;
-        let row = sqlx::query(
+        let mut c = sqlx::any::AnyConnection::connect(&db_url).await?;
+        let row = sqlx::query::query(
             "SELECT
                 42 as integer,
                 42.25 as real,
@@ -546,8 +552,8 @@ mod tests {
         let Some(db_url) = db_specific_test("mssql") else {
             return Ok(());
         };
-        let mut c = sqlx::AnyConnection::connect(&db_url).await?;
-        let row = sqlx::query(
+        let mut c = sqlx::any::AnyConnection::connect(&db_url).await?;
+        let row = sqlx::query::query(
             "SELECT
                 CAST(1 AS BIT) as true_bit,
                 CAST(0 AS BIT) as false_bit,
@@ -639,10 +645,10 @@ mod tests {
     #[actix_web::test]
     async fn test_canonical_col_name_variations() -> anyhow::Result<()> {
         let db_url = test_database_url();
-        let mut c = sqlx::AnyConnection::connect(&db_url).await?;
+        let mut c = sqlx::any::AnyConnection::connect(&db_url).await?;
 
         // Test various column name formats to ensure canonical_col_name works correctly
-        let row = sqlx::query(
+        let row = sqlx::query::query(
             r#"SELECT
                 42 as "UPPERCASE_COL",
                 42 as "lowercase_col",
@@ -695,11 +701,11 @@ mod tests {
     #[actix_web::test]
     async fn test_row_to_json_edge_cases() -> anyhow::Result<()> {
         let db_url = test_database_url();
-        let mut c = sqlx::AnyConnection::connect(&db_url).await?;
+        let mut c = sqlx::any::AnyConnection::connect(&db_url).await?;
         let dbms_name = c.dbms_name().await.expect("retrieve db name");
 
         // Test edge cases for row_to_json
-        let row = sqlx::query(
+        let row = sqlx::query::query(
             "SELECT
                 NULL as null_col,
                 '' as empty_string,

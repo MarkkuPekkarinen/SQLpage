@@ -5,8 +5,9 @@ use crate::{AppState, TEMPLATES_DIR};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use sqlx::any::{AnyStatement, AnyTypeInfo};
+use sqlx::executor::Executor;
 use sqlx::postgres::types::PgTimeTz;
-use sqlx::{Executor, Postgres, Statement, Type};
+use sqlx::{postgres::Postgres, statement::Statement, types::Type};
 use std::fmt::Write;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -429,7 +430,7 @@ impl DbFsQueries {
 #[actix_web::test]
 async fn test_sql_file_read_utf8() -> anyhow::Result<()> {
     use crate::app_config;
-    use sqlx::Executor;
+    use sqlx::executor::Executor;
     let config = app_config::tests::test_config();
     let state = AppState::init(&config).await?;
 
@@ -463,7 +464,7 @@ async fn test_sql_file_read_utf8() -> anyhow::Result<()> {
         make_placeholder(dbms, 1),
         make_placeholder(dbms, 2)
     );
-    sqlx::query(&insert_sql)
+    sqlx::query::query(&insert_sql)
         .bind("unit test file.txt")
         .bind("Héllö world! 😀".as_bytes())
         .execute(conn)

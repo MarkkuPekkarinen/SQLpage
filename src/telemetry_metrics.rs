@@ -2,7 +2,7 @@ use opentelemetry::global;
 use opentelemetry::metrics::{Histogram, ObservableGauge};
 use opentelemetry_semantic_conventions::attribute as otel;
 use opentelemetry_semantic_conventions::metric as otel_metric;
-use sqlx::AnyPool;
+use sqlx::any::AnyPool;
 
 pub struct TelemetryMetrics {
     pub http_request_duration: Histogram<f64>,
