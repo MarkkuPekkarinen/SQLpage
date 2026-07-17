@@ -4,12 +4,13 @@ set message = json_object(
     'subject', :subject,
     'body', :body
 );
-set sent_message = sqlpage.send_mail($message);
+set result = sqlpage.send_mail($message);
 
 select
     'alert' as component,
-    'success' as color,
-    'Email sent successfully' as title;
+    case when json_extract($result, '$.status') = 'accepted' then 'success' else 'danger' end as color,
+    case when json_extract($result, '$.status') = 'accepted' then 'Email sent successfully' else 'Email could not be sent' end as title,
+    json_extract($result, '$.error') as description;
 
 select 'button' as component;
 select 'Send another email' as title, 'index.sql' as link;

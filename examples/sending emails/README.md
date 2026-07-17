@@ -23,9 +23,9 @@ set message = json_object(
     'subject', :subject,
     'body', :body
 );
-set _ = sqlpage.send_mail($message);
+set result = sqlpage.send_mail($message);
 ```
 
-`sqlpage.send_mail` returns `NULL` after the SMTP relay accepts the message. It raises an error when the relay rejects the message or cannot be reached, so statements after the call run only on success.
+`sqlpage.send_mail` returns `{"status":"accepted"}` after the SMTP relay accepts the message. If validation, connection, authentication, or submission fails, it returns `{"status":"error","error_code":"...","error":"..."}` instead of stopping the request. Check `status` before reporting success. Passing SQL `NULL` returns SQL `NULL` without sending or logging a warning.
 
 Do not expose an unrestricted form like this publicly. In production, authenticate users, restrict recipients, validate input, and add rate limiting to prevent abuse.

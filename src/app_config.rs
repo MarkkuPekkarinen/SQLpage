@@ -8,6 +8,7 @@ use openidconnect::IssuerUrl;
 use percent_encoding::AsciiSet;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -78,7 +79,7 @@ impl AppConfig {
 
         config.resolve_timeouts();
 
-        log::debug!("Loaded configuration: {config:#?}");
+        log::debug!("Loaded configuration: {:#?}", RedactedSmtpPassword(&config));
         log::info!(
             "Configuration loaded from {}",
             config.configuration_directory.display()
@@ -180,6 +181,18 @@ impl AppConfig {
         }
 
         Ok(())
+    }
+}
+
+struct RedactedSmtpPassword<'a>(&'a AppConfig);
+
+impl fmt::Debug for RedactedSmtpPassword<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut config = self.0.clone();
+        if config.smtp_password.is_some() {
+            config.smtp_password = Some("[REDACTED]".to_string());
+        }
+        config.fmt(formatter)
     }
 }
 
@@ -856,6 +869,16 @@ mod test {
 
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("smtp_username and smtp_password"));
+    }
+
+    #[test]
+    fn smtp_password_is_redacted_from_config_debug_log() {
+        let mut config = tests::test_config();
+        config.smtp_password = Some("super-secret".to_string());
+
+        let debug = format!("{:?}", RedactedSmtpPassword(&config));
+        assert!(debug.contains("smtp_password: Some(\"[REDACTED]\")"));
+        assert!(!debug.contains("super-secret"));
     }
 
     #[test]
