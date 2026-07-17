@@ -4514,7 +4514,7 @@ dependencies = [
 
 [[package]]
 name = "sqlpage"
-version = "0.44.1"
+version = "0.45.0"
 dependencies = [
  "actix-http",
  "actix-multipart",
