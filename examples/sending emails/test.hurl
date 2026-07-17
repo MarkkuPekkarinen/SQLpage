@@ -23,7 +23,8 @@ subject: Simple SMTP demo
 body: Sent with the configured sender
 HTTP 200
 [Asserts]
-xpath "string(//*[contains(@class, 'alert') and contains(., 'Email sent successfully')])" contains "Email sent successfully"
+xpath "normalize-space(//*[@id='send-result'])" == "Email sent successfully"
+xpath "string(//a[normalize-space(.)='Open Mailpit inbox']/@href)" == "http://localhost:8025"
 
 GET http://127.0.0.1:8025/api/v1/search?query=subject%3A%22Simple%20SMTP%20demo%22
 HTTP 200
@@ -65,7 +66,8 @@ body: Sent to a team with an attachment
 attachment: file,test-attachment.txt; text/plain
 HTTP 200
 [Asserts]
-xpath "string(//*[contains(@class, 'alert') and contains(., 'Email sent successfully')])" contains "Email sent successfully"
+xpath "normalize-space(//*[@id='send-result'])" == "Email sent successfully"
+xpath "string(//a[normalize-space(.)='Open Mailpit inbox']/@href)" == "http://localhost:8025"
 
 GET http://127.0.0.1:8025/api/v1/search?query=subject%3A%22Advanced%20SMTP%20demo%22
 HTTP 200
