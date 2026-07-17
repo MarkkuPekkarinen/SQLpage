@@ -35,6 +35,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: 'npm'
       - run: npm ci
       - run: npm test
       - name: Set up cargo cache
@@ -195,11 +199,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: lts/*
+          node-version: 24
           cache: 'npm'
           cache-dependency-path: ./tests/end-to-end/package-lock.json
       - run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
-      - run: npm ci && npx playwright install --with-deps chromium
+      - run: npm ci && npx playwright install --with-deps --only-shell chromium
       # The browser tests exercise the official site, but they do not need a
       # separate Rust build. Reuse the binary compiled and tested above.
       - name: Download Linux binary
