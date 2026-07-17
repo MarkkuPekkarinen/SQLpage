@@ -86,6 +86,54 @@ pub fn vec_to_data_uri_value(bytes: &[u8]) -> serde_json::Value {
     serde_json::Value::String(vec_to_data_uri(bytes))
 }
 
+/// Decodes a data URL into its declared media type and raw bytes.
+pub fn decode_data_uri(data_url: &str) -> anyhow::Result<(&str, Vec<u8>)> {
+    decode_data_uri_with_limit(data_url, usize::MAX)
+}
+
+/// Decodes a data URL while limiting the size of the decoded bytes.
+pub fn decode_data_uri_with_limit(
+    data_url: &str,
+    max_decoded_size: usize,
+) -> anyhow::Result<(&str, Vec<u8>)> {
+    use anyhow::Context as _;
+
+    let rest = data_url
+        .strip_prefix("data:")
+        .context("Invalid data URL: missing 'data:' prefix")?;
+    let (mut media_type, data) = rest
+        .split_once(',')
+        .context("Invalid data URL: missing comma")?;
+    let is_base64 = media_type.ends_with(";base64");
+    let max_percent_decoded_size = if is_base64 {
+        max_decoded_size
+            .saturating_add(2)
+            .saturating_div(3)
+            .saturating_mul(4)
+    } else {
+        max_decoded_size
+    };
+    let percent_decoded = percent_encoding::percent_decode(data.as_bytes())
+        .take(max_percent_decoded_size.saturating_add(1))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        percent_decoded.len() <= max_percent_decoded_size,
+        "Decoded data exceeds the limit of {max_decoded_size} bytes"
+    );
+    let bytes = if let Some(stripped) = media_type.strip_suffix(";base64") {
+        media_type = stripped;
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, percent_decoded)
+            .context("Invalid base64 data in data URL")?
+    } else {
+        percent_decoded
+    };
+    anyhow::ensure!(
+        bytes.len() <= max_decoded_size,
+        "Decoded data exceeds the limit of {max_decoded_size} bytes"
+    );
+    Ok((media_type, bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +187,35 @@ mod tests {
             detect_mime_type(&[0x00, 0x01, 0x02, 0x03]),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn decodes_base64_and_percent_encoded_data_urls() {
+        assert_eq!(
+            decode_data_uri("data:text/plain;base64,aGVsbG8=").unwrap(),
+            ("text/plain", b"hello".to_vec())
+        );
+        assert_eq!(
+            decode_data_uri("data:text/plain,hello%20world").unwrap(),
+            ("text/plain", b"hello world".to_vec())
+        );
+    }
+
+    #[test]
+    fn limits_decoded_data_url_size_before_decoding() {
+        assert_eq!(
+            decode_data_uri_with_limit("data:text/plain;base64,aGVsbG8=", 5).unwrap(),
+            ("text/plain", b"hello".to_vec())
+        );
+        assert!(decode_data_uri_with_limit("data:text/plain;base64,aGVsbG8=", 4).is_err());
+        assert!(decode_data_uri_with_limit("data:text/plain,hello%20world", 10).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_data_urls() {
+        assert!(decode_data_uri("text/plain,hello").is_err());
+        assert!(decode_data_uri("data:text/plain").is_err());
+        assert!(decode_data_uri("data:;base64,not base64").is_err());
     }
 
     #[test]

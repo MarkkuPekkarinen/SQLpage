@@ -3,7 +3,12 @@ use anyhow::{Context, anyhow};
 use rustls_native_certs::CertificateResult;
 use std::sync::OnceLock;
 
-static NATIVE_CERTS: OnceLock<anyhow::Result<rustls::RootCertStore>> = OnceLock::new();
+struct NativeCertificates {
+    certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
+    root_store: rustls::RootCertStore,
+}
+
+static NATIVE_CERTIFICATES: OnceLock<anyhow::Result<NativeCertificates>> = OnceLock::new();
 
 pub fn make_http_client(config: &crate::app_config::AppConfig) -> anyhow::Result<awc::Client> {
     make_http_client_with_system_roots(config.system_root_ca_certificates)
@@ -14,29 +19,51 @@ pub(crate) fn default_system_root_ca_certificates_from_env() -> bool {
         || std::env::var("SSL_CERT_DIR").is_ok_and(|value| !value.is_empty())
 }
 
+fn native_certificates() -> anyhow::Result<&'static NativeCertificates> {
+    NATIVE_CERTIFICATES
+        .get_or_init(|| {
+            log::debug!(
+                "Loading native certificates because system_root_ca_certificates is enabled"
+            );
+            let CertificateResult {
+                certs,
+                errors,
+                ..
+            } = rustls_native_certs::load_native_certs();
+            log::debug!("Loaded {} native TLS client certificates", certs.len());
+            for error in errors {
+                log::error!("Unable to load native certificate: {error}");
+            }
+            let mut root_store = rustls::RootCertStore::empty();
+            for cert in &certs {
+                log::trace!("Adding native certificate to root store: {cert:?}");
+                root_store.add(cert.clone()).with_context(|| {
+                    format!("Unable to add certificate to root store: {cert:?}")
+                })?;
+            }
+            Ok(NativeCertificates {
+                certificates: certs,
+                root_store,
+            })
+        })
+        .as_ref()
+        .map_err(|error| {
+            anyhow!(
+                "Unable to load native certificates, make sure the system root CA certificates are available: {error}"
+            )
+        })
+}
+
+pub(crate) fn native_certificate_der()
+-> anyhow::Result<&'static [rustls::pki_types::CertificateDer<'static>]> {
+    Ok(&native_certificates()?.certificates)
+}
+
 pub(crate) fn make_http_client_with_system_roots(
     system_root_ca_certificates: bool,
 ) -> anyhow::Result<awc::Client> {
     let connector = if system_root_ca_certificates {
-        let roots = NATIVE_CERTS
-            .get_or_init(|| {
-                log::debug!("Loading native certificates because system_root_ca_certificates is enabled");
-                let CertificateResult { certs, errors, .. } = rustls_native_certs::load_native_certs();
-                log::debug!("Loaded {} native HTTPS client certificates", certs.len());
-                for error in errors {
-                    log::error!("Unable to load native certificate: {error}");
-                }
-                let mut roots = rustls::RootCertStore::empty();
-                for cert in certs {
-                    log::trace!("Adding native certificate to root store: {cert:?}");
-                    roots.add(cert.clone()).with_context(|| {
-                        format!("Unable to add certificate to root store: {cert:?}")
-                    })?;
-                }
-                Ok(roots)
-            })
-            .as_ref()
-            .map_err(|e| anyhow!("Unable to load native certificates, make sure the system root CA certificates are available: {e}"))?;
+        let roots = &native_certificates()?.root_store;
 
         log::trace!(
             "Creating HTTP client with custom TLS connector using native certificates. SSL_CERT_FILE={:?}, SSL_CERT_DIR={:?}",

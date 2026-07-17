@@ -210,6 +210,12 @@ impl<'a, 'b: 'a> IntoCow<'a> for &'b str {
     }
 }
 
+impl<'a> IntoCow<'a> for () {
+    fn into_cow(self) -> Option<Cow<'a, str>> {
+        None
+    }
+}
+
 impl<'a, T: IntoCow<'a>> IntoCow<'a> for Option<T> {
     fn into_cow(self) -> Option<Cow<'a, str>> {
         self.and_then(IntoCow::into_cow)

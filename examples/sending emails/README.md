@@ -1,76 +1,42 @@
 # Sending Emails with SQLPage
 
-SQLPage lets you interact with any email service through their API,
-using the [`sqlpage.fetch` function](https://sql-page.com/functions.sql?function=fetch).
+This example sends plain-text email with [`sqlpage.send_mail`](https://sql-page.com/functions.sql?function=send_mail). The included Docker Compose setup uses [Mailpit](https://mailpit.axllent.org/) as a local SMTP server, so no email leaves your computer.
 
-## Why Use an Email Service?
+Run the example:
 
-Sending emails directly from your server can be challenging:
-- Many ISPs block direct email sending to prevent spam
-- Email deliverability requires proper setup of SPF, DKIM, and DMARC records
-- Managing bounce handling and spam complaints is complex
-- Direct sending can impact your server's IP reputation
-
-Email services solve these problems by providing reliable APIs for sending emails while handling deliverability, tracking, and compliance.
-
-## Popular Email Services
-
-- [Mailgun](https://www.mailgun.com/) - Developer-friendly, great for transactional emails
-- [SendGrid](https://sendgrid.com/) - Powerful features, owned by Twilio
-- [Amazon SES](https://aws.amazon.com/ses/) - Cost-effective for high volume
-- [Postmark](https://postmarkapp.com/) - Focused on transactional email delivery
-- [SMTP2GO](https://www.smtp2go.com/) - Simple SMTP service with API options
-
-## Example: Sending Emails with Mailgun
-
-Here's a complete example using Mailgun's API to send emails through SQLPage:
-
-### [`email.sql`](./email.sql)
-```sql
--- Configure the email request
-set email_request = json_object(
-    'url', 'https://api.mailgun.net/v3/' || sqlpage.environment_variable('MAILGUN_DOMAIN') || '/messages',
-    'method', 'POST',
-    'headers', json_object(
-        'Content-Type', 'application/x-www-form-urlencoded',
-        'Authorization', 'Basic ' || encode(('api:' || sqlpage.environment_variable('MAILGUN_API_KEY'))::bytea, 'base64')
-    ),
-    'body', 
-        'from=Your Name <noreply@' || sqlpage.environment_variable('MAILGUN_DOMAIN') || '>'
-        || '&to=' || $to_email
-        || '&subject=' || $subject
-        || '&text=' || $message_text
-        || '&html=' || $message_html
-);
-
--- Send the email using sqlpage.fetch
-set email_response = sqlpage.fetch($email_request);
-
--- Handle the response
-select 
-    'alert' as component,
-    case 
-        when $email_response->>'id' is not null then 'Email sent successfully'
-        else 'Failed to send email: ' || ($email_response->>'message')
-    end as title;
+```sh
+docker compose up --build
 ```
 
-### Setup Instructions
+This builds SQLPage from the current repository checkout before starting the example.
 
-1. Sign up for a [Mailgun account](https://signup.mailgun.com/new/signup)
-2. Verify your domain or use the sandbox domain for testing
-3. Get your API key from the Mailgun dashboard
-4. Set these environment variables in your SQLPage configuration:
-   ```
-   MAILGUN_API_KEY=your-api-key-here
-   MAILGUN_DOMAIN=your-domain.com
-   ```
+Open http://localhost:8080 and choose one of two flows, then inspect the message in the Mailpit inbox at http://localhost:8025:
 
-## Best Practices
+- **Simple email** sends to one recipient with the `SMTP_FROM` sender configured in Docker Compose.
+- **Advanced email** demonstrates multiple recipients, Cc, Reply-To, a per-message sender override, and an uploaded attachment.
 
-- If you share your code with others, it should not contain sensitive data like API keys
-  - Instead, use environment variables with [`sqlpage.environment_variable`](https://sql-page.com/functions.sql?function=environment_variable)
-- Implement proper error handling
-- Consider rate limiting for bulk sending
-- Include unsubscribe links when sending marketing emails
-- Follow email regulations (GDPR, CAN-SPAM Act)
+The SMTP server is configured in [`docker-compose.yml`](./docker-compose.yml) with `SMTP_HOST=mailpit`, `SMTP_PORT=1025`, `SMTP_TLS_MODE=none`, and a default `SMTP_FROM`. Plaintext mode is intended only for trusted local SMTP servers such as Mailpit.
+
+For a remote SMTP relay, keep the default `SMTP_TLS_MODE=starttls`, or set it to `tls` when the relay requires implicit TLS. Configure `SMTP_USERNAME` and `SMTP_PASSWORD` when authentication is required; SQLPage rejects credentials in plaintext mode.
+
+The simple handler omits `from`, so SQLPage uses the configured `SMTP_FROM`:
+
+```sql
+set message = json_object(
+    'to', :recipient,
+    'subject', :subject,
+    'body', :body
+);
+set result = sqlpage.send_mail($message);
+```
+
+The advanced handler turns the temporary uploaded file into the data URL expected by an attachment:
+
+```sql
+set attachment_path = sqlpage.uploaded_file_path('attachment');
+set attachment_data_url = sqlpage.read_file_as_data_url($attachment_path);
+```
+
+`sqlpage.send_mail` returns `{"status":"accepted"}` after the SMTP relay accepts the message. If validation, connection, authentication, or submission fails, it returns `{"status":"error","error_code":"...","error":"..."}` instead of stopping the request. Check `status` before reporting success. Passing SQL `NULL` returns SQL `NULL` without sending or logging a warning.
+
+Do not expose unrestricted forms like these publicly. In production, authenticate users, restrict recipients, validate input and uploaded files, and add rate limiting to prevent abuse.
